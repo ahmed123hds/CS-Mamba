@@ -1,0 +1,37 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch Checkpoints (Do not push large weights to GitHub)
+*.pt
+*.pth
+*.ckpt
+best_*.pt
+
+# Data Files / Datasets
+data_pcam/
+data/
+*.h5
+*.gz
+*.part
+*.svs
+*.geojson
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Environment
+venv/
+env/
+.env
+pytorch_env/
+
+# LaTeX logs
+*.log
+*.aux
+*.out
+*.toc
+*.synctex.gz

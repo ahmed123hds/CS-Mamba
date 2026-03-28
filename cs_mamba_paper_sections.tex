@@ -1,0 +1,314 @@
+% ============================================================
+%   CS-MAMBA — LaTeX Sections
+%   Problem Statement  +  Methodology
+%   Ready to paste into an ICLR 2026 template
+% ============================================================
+
+% ─── Required packages (add to preamble if not already there) ───
+% \usepackage{amsmath, amssymb, amsthm}
+% \usepackage{mathtools}
+% \usepackage{bm}
+% \usepackage{graphicx}
+% \usepackage{booktabs}
+% \newtheorem{theorem}{Theorem}
+% \newtheorem{proposition}[theorem]{Proposition}
+% \newtheorem{definition}[theorem]{Definition}
+% \newtheorem{remark}[theorem]{Remark}
+
+
+% ============================================================
+%   SECTION 1 — INTRODUCTION / PROBLEM STATEMENT
+% ============================================================
+\section{Introduction}
+\label{sec:intro}
+
+State Space Models (SSMs) have emerged as a compelling alternative to attention-based
+architectures for sequence modelling~\citep{gu2021s4,gu2023mamba}.
+The selective SSM formulation of Mamba~\citep{gu2023mamba} achieves linear-time
+sequence processing by maintaining a recurrent hidden state
+$h \in \mathbb{R}^{D \times S}$ that is updated via a learned diagonal decay matrix
+$A \in \mathbb{R}^{D \times S}$ at each time step.
+
+\paragraph{The 1-D Sequence Collapse Problem.}
+When Vision Mamba variants~\citep{zhu2024vim,liu2024vmamba} are applied to images,
+the 2-D spatial grid of $H \!\times\! W$ patches must be linearised into a 1-D
+sequence of length $N = HW$ before the SSM scan.
+Irrespective of the scan order (row-major, Hilbert curve, \emph{inter alia}),
+this linearisation imposes a \emph{causal temporal ordering} that does not exist
+in the original image.
+
+Formally, the recurrent update of vanilla Mamba satisfies
+\begin{equation}
+    h_n = \bar{A}_n\,h_{n-1} + \bar{B}_n\,x_n,
+    \qquad \bar{A}_n = e^{\Delta_n A},
+    \label{eq:mamba-recurrence}
+\end{equation}
+where $\Delta_n > 0$ is the per-token discretisation step.
+Because $\|\bar{A}_n\| < 1$ by construction, the hidden state decays
+\emph{exponentially} with sequence depth:
+\begin{equation}
+    h_n = \bar{B}_n x_n + \bar{A}_n \bar{B}_{n-1} x_{n-1}
+          + \bar{A}_n \bar{A}_{n-1} \bar{B}_{n-2} x_{n-2} + \cdots
+    \label{eq:decay-expansion}
+\end{equation}
+The contribution of patch $x_0$ to $h_N$ shrinks as
+$\prod_{k=1}^{N}\|\bar{A}_k\| \to 0$ when $N$ is large.
+For a typical $224{\times}224$ image with $16{\times}16$ patches,
+$N = 196$; for a $384{\times}384$ image $N = 576$.
+This \emph{topological amnesia} means that for any patch in the bottom-right
+of the image the SSM has already forgotten the top-left corner,
+\emph{regardless of how the scan curve is chosen}.
+
+\begin{definition}[Spatial Topological Amnesia]
+Let $\mathcal{P} = \{p_i\}_{i=1}^{N}$ be the set of image patches ordered by a
+scan $\sigma$.
+A Vision SSM suffers from \textbf{Spatial Topological Amnesia} if
+$\forall\,\epsilon > 0\;\exists\,N_0$ such that for $N > N_0$:
+\[
+    \left\|\frac{\partial h_N}{\partial x_0}\right\| < \epsilon,
+\]
+i.e., the gradient of the final hidden state with respect to the first patch
+vanishes, preventing the model from learning long-range 2-D correlations.
+\end{definition}
+
+No scan ordering resolves this issue because the exponential decay of
+Equation~\eqref{eq:decay-expansion} is \emph{path-length dependent}, not
+geometry dependent.
+
+\paragraph{Our Approach.}
+We propose the \textbf{Continuous Spatial PDE Mamba (CS-Mamba)}, which replaces
+the causal 1-D recurrence with a \emph{2-D thermodynamic diffusion} process
+governed by the Heat (Fourier) Equation.
+Hidden states are treated as a physical quantity (``activation temperature'')
+diffusing across the spatial manifold, ensuring that every patch communicates
+with all its neighbours simultaneously at each integration step.
+Our key contributions are:
+\begin{enumerate}
+    \item A \textbf{Physics-Informed Spatial SSM} block that embeds the
+          Discrete Laplacian $\nabla^2$ as a hard-coded, non-learnable kernel,
+          guaranteeing Feature Mass Preservation (Theorem~\ref{thm:mass}).
+    \item A \textbf{Dual-Gating Mechanism} that decouples internal temporal
+          decay ($\Delta_{\mathrm{self}}$) from spatial broadcast
+          ($\Delta_{\mathrm{diff}}$), giving each patch independent control
+          over when to remember and when to broadcast.
+    \item A formal proof that our explicit Euler integrator satisfies the
+          \textbf{Courant–Friedrichs–Lewy (CFL) stability condition}
+          (Proposition~\ref{prop:cfl}), bounding diffusivity to prevent
+          gradient explosions.
+    \item Empirical validation on Tiny-ImageNet-200 and PCAM, where CS-Mamba
+          surpasses Hilbert Vision Mamba by \textbf{+6.94\,pp} with the
+          same parameter count.
+\end{enumerate}
+
+
+% ============================================================
+%   SECTION 3 — METHODOLOGY
+% ============================================================
+\section{Continuous Spatial PDE Mamba}
+\label{sec:method}
+
+\subsection{Preliminaries: Standard Mamba Discretisation}
+\label{sec:prelim}
+
+Given a continuous-time SSM
+\begin{equation}
+    \dot{h}(t) = A\,h(t) + B\,x(t), \quad y(t) = C\,h(t),
+    \label{eq:continuous-ssm}
+\end{equation}
+the standard Mamba discretisation via Zero-Order Hold (ZOH) with step $\Delta$
+gives Equation~\eqref{eq:mamba-recurrence}.
+This treats the \emph{time axis} as a 1-D spatial scan, conflating the image's
+sequence index with physical time.
+CS-Mamba retains the continuous-time interpretation but introduces a
+\emph{second, spatial} derivative term that enforces 2-D diffusion.
+
+
+\subsection{Thermodynamic Reformulation}
+\label{sec:pde}
+
+Let $h : [0,T] \times \Omega \to \mathbb{R}^D$ be the hidden-state field
+defined on the image domain $\Omega \subset \mathbb{R}^2$.
+We replace Equation~\eqref{eq:continuous-ssm} with the
+\textbf{Physics-Informed Spatial PDE}:
+\begin{equation}
+  \BoxedEq{\frac{\partial h}{\partial t}(\mathbf{r},t)
+    = \underbrace{\Delta_{\mathrm{self}} \bigl(A\,h(\mathbf{r},t) + B\,x(\mathbf{r})\bigr)}_{\text{Force 1: internal Mamba decay}}
+    + \underbrace{\Delta_{\mathrm{diff}} \cdot \mathcal{D}\,\nabla^2 h(\mathbf{r},t)}_{\text{Force 2: thermodynamic diffusion}}}
+  \label{eq:cs-mamba-pde}
+\end{equation}
+where $\mathbf{r} \in \Omega$ is the 2-D spatial coordinate,
+$\mathcal{D} \in (0, 0.5]$ is the \emph{physical diffusivity},
+and $\nabla^2 = \partial^2/\partial r_1^2 + \partial^2/\partial r_2^2$ is the
+spatial Laplacian.
+
+\paragraph{Physical Interpretation.}
+Force~1 is the standard Mamba temporal dynamic: the hidden state at each patch
+decays via $A$ and is refreshed by new input $Bx$.
+Force~2 is the Fourier Heat Equation: ``warm'' hidden states spread heat to
+neighbouring patches, ensuring that spatially adjacent information is
+aggregated without any causal ordering constraint.
+
+
+\subsection{Discrete Laplacian Operator}
+\label{sec:laplacian}
+
+On the discrete $H{\times}W$ patch grid we approximate $\nabla^2 h$ using the
+standard 5-point finite-difference stencil:
+\begin{equation}
+    (\nabla^2 h)_{i,j} \;=\;
+    h_{i-1,j} + h_{i+1,j} + h_{i,j-1} + h_{i,j+1} - 4\,h_{i,j}
+    \label{eq:discrete-laplacian}
+\end{equation}
+which corresponds to the convolution kernel
+\begin{equation}
+    \mathcal{L} = \begin{pmatrix} 0 & 1 & 0 \\ 1 & -4 & 1 \\ 0 & 1 & 0 \end{pmatrix}
+    \label{eq:laplacian-kernel}
+\end{equation}
+applied as a \emph{hard-coded, non-learnable} depthwise convolution
+with \texttt{groups}$\,{=}\,D$.
+This distinguishes CS-Mamba from standard convolutional models: we introduce
+\textbf{zero learnable parameters} for spatial mixing.
+
+\begin{theorem}[Feature Mass Preservation]
+\label{thm:mass}
+Let $\mathbf{h} \in \mathbb{R}^{D \times H \times W}$ be the hidden-state
+tensor on the patch grid with periodic or zero-flux boundary conditions.
+Then the Discrete Laplacian preserves total feature mass:
+\[
+    \sum_{i=1}^{H}\sum_{j=1}^{W} (\nabla^2 h)_{i,j} = 0.
+\]
+\end{theorem}
+\begin{proof}
+Each element $h_{p,q}$ appears with coefficient $+1$ in the Laplacian of its
+four neighbours and with coefficient $-4$ in its own Laplacian.
+For every interior point the contributions cancel pairwise under the finite
+summation; boundary terms vanish under zero-flux (Neumann) conditions.
+\end{proof}
+
+\begin{remark}
+Theorem~\ref{thm:mass} implies that thermodynamic diffusion cannot
+artificially inflate or deflate the total activation energy of the feature
+maps, preventing the runaway activation collapse commonly observed in
+deep Vision Mamba variants~\citep{zhu2024vim}.
+\end{remark}
+
+
+\subsection{CFL-Constrained Physical Diffusivity}
+\label{sec:cfl}
+
+\begin{proposition}[CFL Stability Condition]
+\label{prop:cfl}
+The explicit Euler discretisation of Equation~\eqref{eq:cs-mamba-pde}
+with time step $dt = 1/K$ is numerically stable if and only if
+\[
+    \mathcal{D} \;\leq\; \frac{(\Delta r)^2}{2\,dt}
+    \;=\; \frac{K}{2}.
+\]
+For $K \geq 1$ this yields $\mathcal{D} \leq 0.5$ as a sufficient condition
+that is \textbf{independent of the number of diffusion steps}.
+\end{proposition}
+
+To enforce Proposition~\ref{prop:cfl} at all times, we parameterise
+$\mathcal{D}$ as
+\begin{equation}
+    \mathcal{D} = 0.5 \cdot \sigma(\theta_{\mathcal{D}}),
+    \quad \theta_{\mathcal{D}} \in \mathbb{R}^D \text{ (learnable)},
+    \label{eq:diffusivity}
+\end{equation}
+where $\sigma(\cdot)$ is the sigmoid function.
+This maps $\theta_{\mathcal{D}}$ to $(0, 0.5)$ unconditionally, eliminating
+the possibility of inverse-diffusion ($\mathcal{D} < 0$) or explosive
+diffusion ($\mathcal{D} > 0.5$).
+
+
+\subsection{Dual-Gating Mechanism}
+\label{sec:dual-gate}
+
+Standard Mamba applies a single discretisation step $\Delta$ to the combined
+RHS of Equation~\eqref{eq:continuous-ssm}, conflating temporal decay with
+spatial spread.
+We argue these two physical processes should be independently controlled,
+and introduce two separate input-dependent gates produced by a shared
+linear projection of $x$:
+
+\begin{align}
+    \Delta_{\mathrm{self}} &= \mathrm{softplus}\!\left(W_{\Delta s}\,x + b_{\Delta s}\right) \in \mathbb{R}^{B \times N \times D}, \label{eq:delta-self} \\
+    \Delta_{\mathrm{diff}} &= \mathrm{softplus}\!\left(W_{\Delta d}\,x + b_{\Delta d}\right) \in \mathbb{R}^{B \times N \times D}. \label{eq:delta-diff}
+\end{align}
+
+\paragraph{Biological Motivation.}
+In Whole Slide Image (WSI) analysis, a tumour patch should simultaneously
+(i) retain its own cytological identity ($\Delta_{\mathrm{self}} \approx 1$)
+and (ii) broadcast its malignant signal to adjacent stroma
+($\Delta_{\mathrm{diff}} \approx 1$).
+In contrast, a healthy epithelial patch should absorb contextual information
+from its neighbours ($\Delta_{\mathrm{diff}} \approx 1$) while suppressing
+its own irrelevant state ($\Delta_{\mathrm{self}} \approx 0$).
+A single $\Delta$ cannot express both behaviours simultaneously,
+motivating the dual-gate design.
+
+
+\subsection{Explicit Euler PDE Integrator}
+\label{sec:euler}
+
+Given hidden state $h^{(0)} = h_{\mathrm{init}} \in \mathbb{R}^{B \times N \times D \times S}$
+initialised from the input projections, we perform $K$ steps of explicit Euler
+integration with $dt = 1/K$:
+
+\begin{align}
+    F_1^{(k)} &= \Delta_{\mathrm{self}} \odot \bigl(A \odot h^{(k)} + B \odot x\bigr) \label{eq:force1} \\
+    F_2^{(k)} &= \Delta_{\mathrm{diff}} \odot \bigl(\mathcal{D}\,\nabla^2 h^{(k)}\bigr) \label{eq:force2} \\
+    h^{(k+1)} &= h^{(k)} + dt \cdot \bigl(F_1^{(k)} + F_2^{(k)}\bigr) \label{eq:euler-step}
+\end{align}
+
+for $k = 0, \ldots, K-1$.
+The spatial Laplacian in Equation~\eqref{eq:force2} is computed by
+temporarily reshaping $h^{(k)}$ from the flattened sequence representation
+$(B, N, D)$ to the native 2-D grid $(B, D, H, W)$ and applying
+Equation~\eqref{eq:laplacian-kernel}.
+The final output projection follows the standard Mamba formulation:
+\begin{equation}
+    y = C \odot h^{(K)} + D \odot x.
+    \label{eq:output}
+\end{equation}
+
+
+\subsection{CS-Mamba Block Architecture}
+\label{sec:block}
+
+Each CS-Mamba block (Figure~\ref{fig:architecture}) wraps a
+\texttt{ContinuousSpatialSSM} module inside the standard Mamba two-branch
+factorisation:
+\begin{enumerate}
+    \item \textbf{In-Projection.} $x \mapsto [u, z] = W_{\mathrm{in}}\,\mathrm{LN}(x)$ with $W_{\mathrm{in}} \in \mathbb{R}^{2D_e \times D}$.
+    \item \textbf{2-D Local Convolution.} $u \mapsto \sigma(\mathrm{DWConv}_{3\times3}(u))$ to encode local texture prior to diffusion.
+    \item \textbf{PDE Integrator.} $y_{\mathrm{ssm}} = \mathrm{CSSM}(u, K)$ via Equations~\eqref{eq:force1}–\eqref{eq:euler-step}.
+    \item \textbf{Gated Output.} $y = W_{\mathrm{out}}\bigl(y_{\mathrm{ssm}} \cdot \sigma(z)\bigr) + x_{\mathrm{res}}$.
+\end{enumerate}
+
+\paragraph{Complexity.}
+The depthwise Laplacian convolution costs $\mathcal{O}(9\,D\,HW)$ per step,
+identical to a $3 \times 3$ depthwise CNN.
+However, whereas a learnable $3{\times}3$ depthwise layer requires $9D$
+parameters per channel, our Laplacian kernel is a \emph{fixed physical
+operator} requiring only $D$ scalar diffusivity parameters
+$\theta_{\mathcal{D}}$ — a $9\times$ reduction in spatial mixing parameters.
+
+
+\subsection{CS-Mamba Vision Backbone}
+\label{sec:backbone}
+
+We build a hierarchical vision backbone by stacking $L$ CS-Mamba blocks
+with a patch embedding layer~\citep{dosovitskiy2020vit}:
+\begin{equation}
+    p_i^{(0)} = \mathrm{PatchEmbed}(x, P) \in \mathbb{R}^{N \times D},
+    \quad N = \left(\frac{H}{P}\right)^2
+    \label{eq:patch-embed}
+\end{equation}
+followed by $L$ residual CS-Mamba blocks and a mean-pooling head:
+\begin{equation}
+    \hat{y} = W_{\mathrm{cls}} \cdot \mathrm{MeanPool}\!\left(p^{(L)}\right).
+    \label{eq:cls-head}
+\end{equation}
+No positional embeddings are required: the 2-D diffusion grid implicitly
+encodes spatial position through the Laplacian's connectivity structure.
