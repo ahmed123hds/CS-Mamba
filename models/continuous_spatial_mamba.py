@@ -6,12 +6,43 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# ── 5-point Laplacian with Neumann BC ─────────────────────────
+def laplacian_2d_neumann(h_2d: torch.Tensor) -> torch.Tensor:
+    h_pad = F.pad(h_2d, (1, 1, 1, 1), mode='replicate')
+    lap = (h_pad[:, :, 0:-2, 1:-1] +   # top
+           h_pad[:, :, 2:,   1:-1] +   # bottom
+           h_pad[:, :, 1:-1, 0:-2] +   # left
+           h_pad[:, :, 1:-1, 2:]   -   # right
+           4.0 * h_2d)                  # center
+    return lap
+
+def cs_mamba_forward_reference(h0, x, delta_s, delta_d, A, B_mat, D_phys, K, H, W):
+    B_val, N, D_dim, S_dim = h0.shape
+    dt = 1.0 / K
+    h = h0.clone()
+    
+    for k in range(K):
+        h_collapsed = h.sum(dim=-1)
+        h_2d = h_collapsed.transpose(1, 2).reshape(B_val, D_dim, H, W)
+        lap_h_2d = laplacian_2d_neumann(h_2d)
+        lap_h = lap_h_2d.reshape(B_val, D_dim, N).transpose(1, 2)
+        diffused = lap_h.unsqueeze(-1)
+        
+        mamba_decay = A.unsqueeze(0).unsqueeze(0) * h
+        mamba_input = torch.einsum('bnd,bns->bnds', x, B_mat)
+        force_1 = delta_s.unsqueeze(-1) * (mamba_decay + mamba_input)
+        
+        D_coeff = D_phys.view(1, 1, -1, 1)
+        force_2 = delta_d.unsqueeze(-1) * D_coeff * diffused
+        
+        h = h + dt * (force_1 + force_2)
+    return h, None
+
 _compiled_cs_mamba_loop = None
 
 def get_compiled_loop():
     global _compiled_cs_mamba_loop
     if _compiled_cs_mamba_loop is None:
-        from triton_kernels.csma_reference import cs_mamba_forward_reference
         def _loop(h0, x_in, ds, dd, a, bm, dp, k, h_dim, w_dim):
             out_h, _ = cs_mamba_forward_reference(h0, x_in, ds, dd, a, bm, dp, k, h_dim, w_dim)
             return out_h
