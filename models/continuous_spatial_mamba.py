@@ -2,6 +2,33 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
+
+logger = logging.getLogger(__name__)
+
+_compiled_cs_mamba_loop = None
+
+def get_compiled_loop():
+    global _compiled_cs_mamba_loop
+    if _compiled_cs_mamba_loop is None:
+        from triton_kernels.csma_reference import cs_mamba_forward_reference
+        def _loop(h0, x_in, ds, dd, a, bm, dp, k, h_dim, w_dim):
+            out_h, _ = cs_mamba_forward_reference(h0, x_in, ds, dd, a, bm, dp, k, h_dim, w_dim)
+            return out_h
+        _compiled_cs_mamba_loop = torch.compile(_loop, mode='reduce-overhead')
+    return _compiled_cs_mamba_loop
+
+def verify_triton_consistency(model, sample_input, atol=1e-4):
+    """Run once on startup to confirm Triton matches reference."""
+    logger.info("Running Triton consistency check...")
+    model.eval()
+    with torch.no_grad():
+        out_triton = model(sample_input, use_triton=True)
+        out_reference = model(sample_input, use_triton=False)
+        max_err = (out_triton - out_reference).abs().max().item()
+        assert max_err < atol, f"Triton/reference mismatch: {max_err:.2e}"
+        logger.info(f"Triton consistency verified: max_err={max_err:.2e}")
+    model.train()
 
 class ContinuousSpatialSSM(nn.Module):
     """
@@ -53,12 +80,10 @@ class ContinuousSpatialSSM(nn.Module):
         # Learnable Diffusivity Constant (D) - Initialized to 0 for stability
         self.diffusivity_raw = nn.Parameter(torch.zeros(1, d_inner, 1, 1))
 
-    def forward(self, x: torch.Tensor, K_steps: int = 3) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, K_steps: int = 3, use_triton: bool = False) -> torch.Tensor:
         B_val, N, D_dim = x.shape
         H = W = int(math.sqrt(N))
         assert H * W == N, "Spatial Mamba requires N to be a perfect square."
-
-        dt = 1.0 / K_steps
 
         # Enforce Re(lambda) < 0 for stability
         A_mat = -F.softplus(self.A_log)           # (D, S) < 0
@@ -71,40 +96,19 @@ class ContinuousSpatialSSM(nn.Module):
         C_mat = self.C_proj(x)                    # (B, N, S)
 
         # 3. Initialize PDE State: h(0) = B(x) * x
-        h = torch.einsum('bnd,bns->bnds', x, B_mat)
-
+        h0 = torch.einsum('bnd,bns->bnds', x, B_mat)
+        
+        # Physics constraint: D MUST be > 0. Max bound 0.5 for CFL.
+        D_phys = torch.sigmoid(self.diffusivity_raw) * 0.5
+        
         # 4. Explicit Euler Spatial Diffusion Loop
-        for _ in range(K_steps):
-            
-            # --- THERMODYNAMIC DIFFUSION ENGINE ---
-            # Collapse S-state temporarily for unified physical routing
-            h_spatial = h.sum(dim=-1) 
-            h_2d = h_spatial.transpose(1, 2).view(B_val, D_dim, H, W) 
-            
-            # Step 1: Calculate Spatial Gradient using True Laplacian (∇²h)
-            laplacian_h = F.conv2d(h_2d, self.laplacian, padding=1, groups=D_dim)
-            
-            # Step 2: Apply Physical Diffusivity Parameter (D * ∇²h)
-            # Physics constraint: D MUST be > 0. If D < 0, it causes inverse-diffusion
-            # which guarantees an instant gradient explosion. Max bound 0.5 for CFL.
-            D_phys = torch.sigmoid(self.diffusivity_raw) * 0.5
-            diffused_h_2d = D_phys * laplacian_h
-            
-            # Reflatten to sequence (B, N, D) and expand state (B, N, D, S)
-            diffused_h = diffused_h_2d.view(B_val, D_dim, N).transpose(1, 2)
-            diffused_h = diffused_h.unsqueeze(-1) # Broadcast back across State dimension
-
-            # --- DUAL GATED PDE STEP ---
-            # Force 1: Internal Mamba Self-Decay (A) + Input (B)
-            mamba_decay = torch.einsum('bnds,ds->bnds', h, A_mat)
-            mamba_input = torch.einsum('bnd,bns->bnds', x, B_mat)
-            force_1 = delta_self.unsqueeze(-1) * (mamba_decay + mamba_input)
-            
-            # Force 2: 2D Spatial Diffusion
-            force_2 = delta_diff.unsqueeze(-1) * diffused_h
-            
-            # Forward Euler Integration
-            h = h + dt * (force_1 + force_2)
+        if use_triton:
+            from triton_kernels.csma_autograd import cs_scan
+            h = cs_scan(h0, x, delta_self, delta_diff, A_mat, B_mat, D_phys, K_steps, H, W)
+        else:
+            # We use the compiled pure PyTorch reference loop for peak throughput
+            compiled_loop = get_compiled_loop()
+            h = compiled_loop(h0, x, delta_self, delta_diff, A_mat, B_mat, D_phys, K_steps, H, W)
 
         # 5. Output Projection: y(T) = C * h(T) + D * x
         y = torch.einsum('bnds,bns->bnd', h, C_mat)
@@ -130,7 +134,7 @@ class ContinuousSpatialMambaBlock(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.out_proj = nn.Linear(expand * d_model, d_model, bias=False)
 
-    def forward(self, x: torch.Tensor, K_steps: int = 3) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, K_steps: int = 3, use_triton: bool = False) -> torch.Tensor:
         residual = x
         B_val, N, D_dim = x.shape
         H = W = int(math.sqrt(N))  # Native 2D grid shape
@@ -149,12 +153,13 @@ class ContinuousSpatialMambaBlock(nn.Module):
         
         # ── PyTorch Memory Optimization (Gradient Checkpointing) ──
         # Fixes OOM by discarding massive intermediate loop tensors during forward pass
-        if self.training:
+        # Note: PyTorch native checkpointing throws "AttributeError: torch has no attribute xla"
+        # when running on TPUs with use_reentrant=False. We bypass it for TPUs since 1.2M params fits entirely in SRAM.
+        if self.training and u.device.type != "xla":
             from torch.utils.checkpoint import checkpoint
-            # use_reentrant=False is required for modern PyTorch 2.x safe checkpointing
-            y_ssm = checkpoint(self.continuous_ssm, u, K_steps, use_reentrant=False)
+            y_ssm = checkpoint(self.continuous_ssm, u, K_steps, use_triton, use_reentrant=False)
         else:
-            y_ssm = self.continuous_ssm(u, K_steps=K_steps)
+            y_ssm = self.continuous_ssm(u, K_steps=K_steps, use_triton=use_triton)
             
         y = y_ssm * F.silu(z)
         y = self.out_proj(y)
@@ -174,10 +179,10 @@ class ContinuousSpatialMambaClassifier(nn.Module):
         self.head = nn.Linear(cfg.d_embed, getattr(cfg, 'n_classes', 10))
         self.K_steps = getattr(cfg, 'K_steps', 3)
 
-    def forward(self, x):
+    def forward(self, x, use_triton: bool = False):
         x = self.embedder(x)
         for block in self.blocks:
-            x = block(x, K_steps=self.K_steps)
+            x = block(x, K_steps=self.K_steps, use_triton=use_triton)
         x = self.norm(x)
         features = x.mean(dim=1)
         return self.head(features)
