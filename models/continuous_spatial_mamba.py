@@ -46,7 +46,9 @@ def get_compiled_loop():
         def _loop(h0, x_in, ds, dd, a, bm, dp, k, h_dim, w_dim):
             out_h, _ = cs_mamba_forward_reference(h0, x_in, ds, dd, a, bm, dp, k, h_dim, w_dim)
             return out_h
-        _compiled_cs_mamba_loop = torch.compile(_loop, mode='reduce-overhead')
+        # On TPUs, torch_xla automatically compiles PyTorch operations into XLA graphs.
+        # Calling torch.compile() (Dynamo/Inductor) on top of XLA often crashes.
+        _compiled_cs_mamba_loop = _loop
     return _compiled_cs_mamba_loop
 
 def verify_triton_consistency(model, sample_input, atol=1e-4):
