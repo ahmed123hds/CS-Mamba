@@ -128,7 +128,7 @@ def _mp_fn(index, flags):
     cfg.canvas_size = flags.img_size  # spatial compat
 
     # ── Init Model & move to specific TPU core ───────────────────
-    model = CGMamba(cfg).to(device)
+    model = CSMamba(cfg).to(device)
     
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = optim.AdamW(model.parameters(), lr=flags.lr, weight_decay=flags.weight_decay)
