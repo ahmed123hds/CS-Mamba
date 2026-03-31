@@ -34,7 +34,7 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 import torch_xla.distributed.parallel_loader as pl
 
-from models.continuous_graph_mamba import ContinuousGraphMambaClassifier as CGMamba
+from models.continuous_spatial_mamba import ContinuousSpatialMambaClassifier as CSMamba
 
 def parse_args():
     p = argparse.ArgumentParser()
