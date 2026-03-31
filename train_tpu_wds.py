@@ -13,9 +13,15 @@ Usage on the TPU VM:
 """
 
 import os
+import sys
+
+# Make sure local modules are importable
+sys.path.insert(0, os.path.dirname(__file__))
+
 import time
 import argparse
 from math import ceil
+import numpy as np
 
 import torch
 import torch.nn as nn
