@@ -146,7 +146,7 @@ def _mp_fn(index, flags):
     para_loader = pl.ParallelLoader(loader, [device]).per_device_loader(device)
     
     xm.master_print(f"\n🚀 Starting TPU Training on Model (Params: {sum(p.numel() for p in model.parameters()):,})")
-    xm.master_print(f"Device topology: {xm.xla_real_devices(device)}")
+    xm.master_print(f"Device topology: {xm.xla_real_devices([device])}")
     xm.master_print(f"Effective Global Batch Size: {global_batch_size}")
     xm.master_print(f"Steps per epoch: {steps_per_epoch}")
     
