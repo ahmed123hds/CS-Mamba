@@ -64,35 +64,28 @@ def parse_args():
     return p.parse_args()
 
 
-class EmptyConfig:
-    pass
-
-
 # ════════════════════════════════════════════════════════════════════
-# MixUp & CutMix Implementation (Pure PyTorch, XLA-Safe)
+# MixUp & CutMix Implementation (Pure PyTorch, CPU-Safe)
 # ════════════════════════════════════════════════════════════════════
 
 def mixup_data(images, labels, alpha=0.8):
-    """MixUp: linearly interpolate two random images and their labels."""
     lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
     batch_size = images.size(0)
-    index = torch.randperm(batch_size, device=images.device)
+    index = torch.randperm(batch_size)
     mixed_images = lam * images + (1 - lam) * images[index]
     return mixed_images, labels, labels[index], lam
 
 
 def cutmix_data(images, labels, alpha=1.0):
-    """CutMix: cut and paste a random patch from one image onto another."""
     lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
     batch_size = images.size(0)
-    index = torch.randperm(batch_size, device=images.device)
+    index = torch.randperm(batch_size)
     
     _, _, H, W = images.shape
     cut_ratio = np.sqrt(1.0 - lam)
     cut_h = int(H * cut_ratio)
     cut_w = int(W * cut_ratio)
     
-    # Random center for the cut box
     cy = np.random.randint(H)
     cx = np.random.randint(W)
     
@@ -104,25 +97,22 @@ def cutmix_data(images, labels, alpha=1.0):
     mixed_images = images.clone()
     mixed_images[:, :, y1:y2, x1:x2] = images[index, :, y1:y2, x1:x2]
     
-    # Adjust lambda to the actual area ratio
     lam = 1 - ((y2 - y1) * (x2 - x1)) / (H * W)
-    
     return mixed_images, labels, labels[index], lam
 
 
 def mixup_criterion(criterion, logits, labels_a, labels_b, lam):
-    """Compute the interpolated loss for MixUp/CutMix."""
     return lam * criterion(logits, labels_a) + (1 - lam) * criterion(logits, labels_b)
 
 
 # ════════════════════════════════════════════════════════════════════
 
-def build_wds_loader(shards_url, batch_size, is_training=True):
+def build_wds_loader(shards_url, batch_size, flags=None, is_training=True):
     if is_training:
         transform = T.Compose([
             T.RandomResizedCrop(224),
             T.RandomHorizontalFlip(),
-            T.RandAugment(num_ops=2, magnitude=9),  # DeiT-level augmentation
+            T.RandAugment(num_ops=2, magnitude=9), 
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
@@ -137,6 +127,25 @@ def build_wds_loader(shards_url, batch_size, is_training=True):
     def apply_transforms(sample):
         image, label = sample
         return transform(image), label
+        
+    def apply_mixup_cutmix_batched(batch):
+        images, labels = batch
+        # WDS batched returns lists of tensors, stack them
+        images = torch.stack(images)
+        labels = torch.tensor(labels, dtype=torch.long)
+        
+        use_mixup = np.random.random() < flags.mixup_prob
+        if use_mixup:
+            mixed_images, labels_a, labels_b, lam = mixup_data(images, labels, flags.mixup_alpha)
+        else:
+            mixed_images, labels_a, labels_b, lam = cutmix_data(images, labels, flags.cutmix_alpha)
+            
+        lam_tensor = torch.tensor(lam, dtype=torch.float32)
+        return mixed_images, labels_a, labels_b, lam_tensor
+
+    def apply_stack_val(batch):
+        images, labels = batch
+        return torch.stack(images), torch.tensor(labels, dtype=torch.long)
 
     dataset = (
         wds.WebDataset(shards_url, resampled=True, nodesplitter=wds.split_by_worker)
@@ -146,6 +155,11 @@ def build_wds_loader(shards_url, batch_size, is_training=True):
         .map(apply_transforms)
         .batched(batch_size, partial=False)
     )
+    
+    if is_training:
+        dataset = dataset.map(apply_mixup_cutmix_batched)
+    else:
+        dataset = dataset.map(apply_stack_val)
     
     loader = wds.WebLoader(dataset, batch_size=None, num_workers=4, pin_memory=False)
     return loader
@@ -185,8 +199,8 @@ def _mp_fn(index, flags):
                         f"Previous Val Acc: {ckpt.get('val_acc', 'N/A')}")
     
     # ── Loaders ──────────────────────────────────────────────
-    train_loader = build_wds_loader(flags.train_shards, flags.batch_size, is_training=True)
-    val_loader   = build_wds_loader(flags.val_shards,   flags.batch_size, is_training=False)
+    train_loader = build_wds_loader(flags.train_shards, flags.batch_size, flags, is_training=True)
+    val_loader   = build_wds_loader(flags.val_shards,   flags.batch_size, flags, is_training=False)
     
     global_batch_size = flags.batch_size * xm.xrt_world_size() 
     train_steps = ceil(1281167 / global_batch_size)
@@ -210,15 +224,11 @@ def _mp_fn(index, flags):
         total_loss, correct, total = 0.0, 0, 0
         t0 = time.time()
         
-        for step, (images, labels) in enumerate(para_train):
+        for step, batch in enumerate(para_train):
             if step >= train_steps: break
             
-            # ── Apply MixUp or CutMix randomly ──
-            use_mixup = np.random.random() < flags.mixup_prob
-            if use_mixup:
-                images, labels_a, labels_b, lam = mixup_data(images, labels, flags.mixup_alpha)
-            else:
-                images, labels_a, labels_b, lam = cutmix_data(images, labels, flags.cutmix_alpha)
+            # Unpack pre-mixed CPU tensors directly from ParallelLoader
+            images, labels_a, labels_b, lam = batch
                 
             optimizer.zero_grad()
             logits = model(images)
@@ -228,7 +238,6 @@ def _mp_fn(index, flags):
             tracker.add(flags.batch_size)
             
             total_loss += loss.item() * images.size(0)
-            # For accuracy tracking, use the primary labels
             correct += logits.argmax(dim=1).eq(labels_a).sum().item()
             total += images.size(0)
             
@@ -246,8 +255,11 @@ def _mp_fn(index, flags):
         model.eval()
         val_loss, val_correct, val_total = 0.0, 0, 0
         
-        for step, (images, labels) in enumerate(para_val):
+        for step, batch in enumerate(para_val):
             if step >= val_steps: break
+            
+            images, labels = batch
+            
             with torch.no_grad():
                 logits = model(images)
                 loss = criterion(logits, labels)
