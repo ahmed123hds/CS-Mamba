@@ -134,9 +134,11 @@ def build_wds_loader(shards_url, batch_size, flags=None, is_training=True):
         
     def apply_mixup_cutmix_batched(batch):
         images, labels = batch
-        # WDS batched returns lists of tensors, stack them
-        images = torch.stack(images)
-        labels = torch.tensor(labels, dtype=torch.long)
+        # .batched() already stacks tensors; just ensure labels are long
+        if not isinstance(labels, torch.Tensor):
+            labels = torch.tensor(labels, dtype=torch.long)
+        else:
+            labels = labels.long()
         
         use_mixup = np.random.random() < flags.mixup_prob
         if use_mixup:
@@ -149,7 +151,11 @@ def build_wds_loader(shards_url, batch_size, flags=None, is_training=True):
 
     def apply_stack_val(batch):
         images, labels = batch
-        return torch.stack(images), torch.tensor(labels, dtype=torch.long)
+        if not isinstance(labels, torch.Tensor):
+            labels = torch.tensor(labels, dtype=torch.long)
+        else:
+            labels = labels.long()
+        return images, labels
 
     dataset = (
         wds.WebDataset(shards_url, resampled=True, nodesplitter=wds.split_by_worker)
