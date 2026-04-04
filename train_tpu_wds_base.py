@@ -1,6 +1,8 @@
 """
 TPU V4-8 WebDataset Streaming Script for CG-Mamba [BASE SCALED MODEL]
 ======================================================================
+With DeiT-level Regularization: MixUp, CutMix, RandAugment
+Supports checkpoint resumption via --resume flag.
 """
 
 import os
@@ -32,24 +34,32 @@ def parse_args():
     
     # ── Dataset URLs ──
     p.add_argument('--train_shards', type=str, required=True,
-                   help='e.g., /home/user/datasets/imagenet_hf/imagenet-1k-train-{0000..1023}.tar')
+                   help='e.g., /home/user/datasets/imagenet_hf/imagenet1k-train-{0000..1023}.tar')
     p.add_argument('--val_shards', type=str, required=True,
-                   help='e.g., /home/user/datasets/imagenet_hf/imagenet-1k-valid-{0000..0041}.tar')
+                   help='e.g., /home/user/datasets/imagenet_hf/imagenet1k-validation-{00..63}.tar')
                    
-    # ── Scaled Model Geometry (ViT-Small/Base Equivalency) ──
-    p.add_argument('--img_size', type=int, default=224, help="ImageNet standard resolution")
-    p.add_argument('--patch_size', type=int, default=16, help="Standard 16x16 patching")
-    p.add_argument('--d_embed', type=int, default=384, help="Increased from 128 to 384 for SOTA capacity")
+    # ── Model Geometry ──
+    p.add_argument('--img_size', type=int, default=224)
+    p.add_argument('--patch_size', type=int, default=16)
+    p.add_argument('--d_embed', type=int, default=384)
     p.add_argument('--d_state', type=int, default=16)
-    p.add_argument('--n_mamba_layers', type=int, default=12, help="Increased from 4 to 12 blocks")
-    p.add_argument('--K_steps', type=int, default=3, help="Keep at 3 for blazing fast throughput!")
+    p.add_argument('--n_mamba_layers', type=int, default=12)
+    p.add_argument('--K_steps', type=int, default=3)
     p.add_argument('--n_classes', type=int, default=1000)
     
     # ── Training Params ──
     p.add_argument('--batch_size', type=int, default=64, help="Batch size PER TPU CORE")
-    p.add_argument('--epochs', type=int, default=300, help="Full standard ImageNet schedule")
+    p.add_argument('--epochs', type=int, default=300)
     p.add_argument('--lr', type=float, default=5e-4)
-    p.add_argument('--weight_decay', type=float, default=1e-4)
+    p.add_argument('--weight_decay', type=float, default=5e-4, help="Increased from 1e-4 for stronger regularization")
+    
+    # ── Checkpoint Resume ──
+    p.add_argument('--resume', type=str, default='', help="Path to checkpoint .pt file to resume from")
+    
+    # ── Regularization (DeiT-level) ──
+    p.add_argument('--mixup_alpha', type=float, default=0.8, help="MixUp interpolation strength")
+    p.add_argument('--cutmix_alpha', type=float, default=1.0, help="CutMix interpolation strength")
+    p.add_argument('--mixup_prob', type=float, default=0.5, help="Probability of applying MixUp vs CutMix")
     
     return p.parse_args()
 
@@ -58,11 +68,61 @@ class EmptyConfig:
     pass
 
 
+# ════════════════════════════════════════════════════════════════════
+# MixUp & CutMix Implementation (Pure PyTorch, XLA-Safe)
+# ════════════════════════════════════════════════════════════════════
+
+def mixup_data(images, labels, alpha=0.8):
+    """MixUp: linearly interpolate two random images and their labels."""
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    batch_size = images.size(0)
+    index = torch.randperm(batch_size, device=images.device)
+    mixed_images = lam * images + (1 - lam) * images[index]
+    return mixed_images, labels, labels[index], lam
+
+
+def cutmix_data(images, labels, alpha=1.0):
+    """CutMix: cut and paste a random patch from one image onto another."""
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    batch_size = images.size(0)
+    index = torch.randperm(batch_size, device=images.device)
+    
+    _, _, H, W = images.shape
+    cut_ratio = np.sqrt(1.0 - lam)
+    cut_h = int(H * cut_ratio)
+    cut_w = int(W * cut_ratio)
+    
+    # Random center for the cut box
+    cy = np.random.randint(H)
+    cx = np.random.randint(W)
+    
+    y1 = max(0, cy - cut_h // 2)
+    y2 = min(H, cy + cut_h // 2)
+    x1 = max(0, cx - cut_w // 2)
+    x2 = min(W, cx + cut_w // 2)
+    
+    mixed_images = images.clone()
+    mixed_images[:, :, y1:y2, x1:x2] = images[index, :, y1:y2, x1:x2]
+    
+    # Adjust lambda to the actual area ratio
+    lam = 1 - ((y2 - y1) * (x2 - x1)) / (H * W)
+    
+    return mixed_images, labels, labels[index], lam
+
+
+def mixup_criterion(criterion, logits, labels_a, labels_b, lam):
+    """Compute the interpolated loss for MixUp/CutMix."""
+    return lam * criterion(logits, labels_a) + (1 - lam) * criterion(logits, labels_b)
+
+
+# ════════════════════════════════════════════════════════════════════
+
 def build_wds_loader(shards_url, batch_size, is_training=True):
     if is_training:
         transform = T.Compose([
             T.RandomResizedCrop(224),
             T.RandomHorizontalFlip(),
+            T.RandAugment(num_ops=2, magnitude=9),  # DeiT-level augmentation
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
@@ -94,7 +154,7 @@ def build_wds_loader(shards_url, batch_size, is_training=True):
 def _mp_fn(index, flags):
     device = xm.xla_device()
     
-    # ── Model Config mapping ─────────────────────────────────
+    # ── Model Config ─────────────────────────────────────────
     cfg = EmptyConfig()
     cfg.img_size = flags.img_size
     cfg.patch_size = flags.patch_size
@@ -111,6 +171,19 @@ def _mp_fn(index, flags):
     optimizer = optim.AdamW(model.parameters(), lr=flags.lr, weight_decay=flags.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=flags.epochs, eta_min=1e-6)
     
+    start_epoch = 1
+    
+    # ── Resume from Checkpoint ───────────────────────────────
+    if flags.resume:
+        xm.master_print(f"📦 Resuming from checkpoint: {flags.resume}")
+        ckpt = torch.load(flags.resume, map_location='cpu')
+        model.load_state_dict(ckpt['state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        scheduler.load_state_dict(ckpt['scheduler'])
+        start_epoch = ckpt['epoch'] + 1
+        xm.master_print(f"✅ Resumed! Starting from epoch {start_epoch} | "
+                        f"Previous Val Acc: {ckpt.get('val_acc', 'N/A')}")
+    
     # ── Loaders ──────────────────────────────────────────────
     train_loader = build_wds_loader(flags.train_shards, flags.batch_size, is_training=True)
     val_loader   = build_wds_loader(flags.val_shards,   flags.batch_size, is_training=False)
@@ -122,11 +195,14 @@ def _mp_fn(index, flags):
     para_train = pl.ParallelLoader(train_loader, [device]).per_device_loader(device)
     para_val   = pl.ParallelLoader(val_loader,   [device]).per_device_loader(device)
     
-    xm.master_print(f"\n🚀 Launching CSMamba Base (Params: {sum(p.numel() for p in model.parameters()):,})")
-    xm.master_print(f"Global Batch Size: {global_batch_size} (64/core on {xm.xla_real_devices([device])})")
-    xm.master_print(f"Train Steps/Epoch: {train_steps} | Val Steps: {val_steps}")
+    xm.master_print(f"\n🚀 Launching CSMamba (Params: {sum(p.numel() for p in model.parameters()):,})")
+    xm.master_print(f"Global Batch Size: {global_batch_size} | "
+                    f"Train Steps/Epoch: {train_steps} | Val Steps: {val_steps}")
+    xm.master_print(f"🛡️  Regularization: MixUp(α={flags.mixup_alpha}) | "
+                    f"CutMix(α={flags.cutmix_alpha}) | RandAugment(n=2,m=9) | "
+                    f"Weight Decay={flags.weight_decay}")
     
-    for epoch in range(1, flags.epochs + 1):
+    for epoch in range(start_epoch, flags.epochs + 1):
         
         # ── 1. TRAINING PHASE ────────────────────────────────────
         model.train()
@@ -136,16 +212,24 @@ def _mp_fn(index, flags):
         
         for step, (images, labels) in enumerate(para_train):
             if step >= train_steps: break
+            
+            # ── Apply MixUp or CutMix randomly ──
+            use_mixup = np.random.random() < flags.mixup_prob
+            if use_mixup:
+                images, labels_a, labels_b, lam = mixup_data(images, labels, flags.mixup_alpha)
+            else:
+                images, labels_a, labels_b, lam = cutmix_data(images, labels, flags.cutmix_alpha)
                 
             optimizer.zero_grad()
             logits = model(images)
-            loss = criterion(logits, labels)
+            loss = mixup_criterion(criterion, logits, labels_a, labels_b, lam)
             loss.backward()
             xm.optimizer_step(optimizer)
             tracker.add(flags.batch_size)
             
             total_loss += loss.item() * images.size(0)
-            correct += logits.argmax(dim=1).eq(labels).sum().item()
+            # For accuracy tracking, use the primary labels
+            correct += logits.argmax(dim=1).eq(labels_a).sum().item()
             total += images.size(0)
             
             if step % 50 == 0:
@@ -158,7 +242,7 @@ def _mp_fn(index, flags):
         global_correct = 100.0 * xm.mesh_reduce("tr_corr", correct, np.sum) / xm.mesh_reduce("tr_tot", total, np.sum)
         train_time = time.time() - t0
         
-        # ── 2. VALIDATION PHASE ──────────────────────────────────
+        # ── 2. VALIDATION PHASE (No MixUp/CutMix!) ──────────────
         model.eval()
         val_loss, val_correct, val_total = 0.0, 0, 0
         
