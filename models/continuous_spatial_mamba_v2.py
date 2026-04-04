@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 # ── Optimized PDE Forward (State-Preserving Diffusion) ─────────────
-def cs_mamba_forward_v2(h0, x, delta_s, delta_d, A, B_mat, D_phys, K, H, W, laplacian_kernel):
+def cs_mamba_forward_v2(h0, x, delta_s, delta_d, A, B_mat, D_phys, K, H, W, laplacian_kernel, mamba_input=None):
     """
     State-Preserving Continuous Spatial PDE Integration.
     
@@ -42,7 +42,8 @@ def cs_mamba_forward_v2(h0, x, delta_s, delta_d, A, B_mat, D_phys, K, H, W, lapl
     h = h0.clone()
 
     # Pre-compute input forcing (does NOT depend on h, constant across K steps)
-    mamba_input = torch.einsum('bnd,bns->bnds', x, B_mat)  # (B, N, D, S)
+    if mamba_input is None:
+        mamba_input = torch.einsum('bnd,bns->bnds', x, B_mat)  # (B, N, D, S)
 
     # Pre-expand constants
     A_exp = A.view(1, 1, D_dim, S_dim)         # (1, 1, D, S)
@@ -147,7 +148,8 @@ class ContinuousSpatialSSM_V2(nn.Module):
         # Explicit Euler Spatial Diffusion Loop (State-Preserving)
         h = cs_mamba_forward_v2(
             h0, x, delta_self, delta_diff, A_mat, B_mat,
-            D_phys, K_steps, H, W, self.laplacian
+            D_phys, K_steps, H, W, self.laplacian,
+            mamba_input=h0 # Optimization: h0 and mamba_input are identical
         )
 
         # Output Projection: y(T) = C * h(T) + D * x
