@@ -64,6 +64,10 @@ def parse_args():
     return p.parse_args()
 
 
+class EmptyConfig:
+    pass
+
+
 # ════════════════════════════════════════════════════════════════════
 # MixUp & CutMix Implementation (Pure PyTorch, CPU-Safe)
 # ════════════════════════════════════════════════════════════════════
