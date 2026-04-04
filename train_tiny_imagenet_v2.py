@@ -121,7 +121,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, cfg):
     t0 = time.time()
     use_mixup = random.random() < 0.5
 
-    for imgs, labels in loader:
+    for step, (imgs, labels) in enumerate(loader):
         imgs, labels = imgs.to(device), labels.to(device)
         optimizer.zero_grad()
 
@@ -143,6 +143,9 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, cfg):
         total_loss += loss.item() * imgs.size(0)
         correct    += (outs.argmax(1) == labels).sum().item()
         total      += imgs.size(0)
+
+        if step % 50 == 0:
+            print(f"    Step {step}/{len(loader)} | Loss: {loss.item():.4f}")
 
     return total_loss / total, 100.0 * correct / total, time.time() - t0
 
@@ -259,13 +262,13 @@ def main():
 
     if cfg.mode in ('v1', 'compare'):
         model_v1 = CSMamba_V1(cfg).to(device)
-        model_v1 = torch.compile(model_v1)
+        # model_v1 = torch.compile(model_v1)  # Skip on consumer GPUs (30min+ overhead)
         results['CSMamba_V1'] = train_model(
             'CSMamba_V1', model_v1, train_loader, val_loader, cfg, device)
 
     if cfg.mode in ('v2', 'compare'):
         model_v2 = CSMamba_V2(cfg).to(device)
-        model_v2 = torch.compile(model_v2)
+        # model_v2 = torch.compile(model_v2)  # Skip on consumer GPUs (30min+ overhead)
         results['CSMamba_V2'] = train_model(
             'CSMamba_V2', model_v2, train_loader, val_loader, cfg, device)
 

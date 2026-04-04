@@ -196,14 +196,10 @@ class ContinuousSpatialMambaBlock_V2(nn.Module):
         u = self.activation(u)
 
         # ── PDE Integration (State-Preserving) ──
-        if self.training and u.device.type != "xla":
-            from torch.utils.checkpoint import checkpoint
-            y_ssm = checkpoint(
-                self.continuous_ssm, u, K_steps, use_triton,
-                use_reentrant=False
-            )
-        else:
-            y_ssm = self.continuous_ssm(u, K_steps=K_steps, use_triton=use_triton)
+        # NOTE: gradient checkpointing removed from GPU path — it causes infinite
+        # compilation hangs when combined with torch.compile.
+        # Use AMP (autocast fp16) for memory savings on GPU instead.
+        y_ssm = self.continuous_ssm(u, K_steps=K_steps, use_triton=use_triton)
 
         y = y_ssm * F.silu(z)
         y = self.out_proj(y)
