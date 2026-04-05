@@ -66,6 +66,7 @@ def parse_args():
     
     # ── Multi-Host (Pod) ──
     p.add_argument('--multi_host', action='store_true', help="Enable multi-host Pod training")
+    p.add_argument('--num_workers', type=int, default=8, help="Dataloader workers per process (increase to fix I/O bottleneck)")
     
     # ── Regularization (DeiT-level) ──
     p.add_argument('--mixup_alpha', type=float, default=0.8)
@@ -170,21 +171,30 @@ def build_wds_loader(shards_url, batch_size, flags=None, is_training=True):
     # Use split_by_node for multi-host Pod training
     nodesplitter = wds.split_by_node if flags and flags.multi_host else wds.split_by_worker
 
+    num_workers = flags.num_workers if flags else 8
+
     dataset = (
         wds.WebDataset(shards_url, resampled=True, nodesplitter=nodesplitter)
-        .shuffle(1000 if is_training else 0)
+        .shuffle(2000 if is_training else 0)  # Larger shuffle buffer
         .decode("pil")
         .to_tuple("jpg;png", "cls")
         .map(apply_transforms)
         .batched(batch_size, partial=False)
+        .prefetch(512)  # Keep buffer full — prevents TPU idle stalls
     )
-    
+
     if is_training:
         dataset = dataset.map(apply_mixup_cutmix_batched)
     else:
         dataset = dataset.map(apply_stack_val)
-    
-    loader = wds.WebLoader(dataset, batch_size=None, num_workers=4, pin_memory=False)
+
+    loader = wds.WebLoader(
+        dataset, batch_size=None,
+        num_workers=num_workers,  # More workers to saturate GCS bandwidth
+        pin_memory=True,           # Faster host→device transfer
+        prefetch_factor=4,         # Each worker prefetches 4 batches ahead
+        persistent_workers=True,   # Avoid worker respawn overhead
+    )
     return loader
 
 
