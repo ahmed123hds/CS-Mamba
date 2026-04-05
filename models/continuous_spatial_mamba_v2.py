@@ -198,13 +198,19 @@ class ContinuousSpatialMambaBlock_V2(nn.Module):
         u = self.activation(u)
 
         # ── PDE Integration (State-Preserving) ──
-        # Gradient checkpointing is now safe because torch.compile is disabled.
-        # This reduces memory usage from ~10GB down to ~3GB for batch 32.
-        from torch.utils.checkpoint import checkpoint
-        y_ssm = checkpoint(
-            self.continuous_ssm, u, K_steps, use_triton,
-            use_reentrant=False
-        )
+        # NOTE: torch.utils.checkpoint with use_reentrant=False calls
+        # getattr(torch, 'xla') to detect the device, which crashes on TPU
+        # because torch_xla is a separate package, not torch.xla.
+        # On XLA: skip checkpointing (XLA runtime manages memory efficiently).
+        # On GPU: use checkpointing to save ~7GB VRAM (safe without torch.compile).
+        if u.device.type == "xla":
+            y_ssm = self.continuous_ssm(u, K_steps=K_steps, use_triton=use_triton)
+        else:
+            from torch.utils.checkpoint import checkpoint
+            y_ssm = checkpoint(
+                self.continuous_ssm, u, K_steps, use_triton,
+                use_reentrant=False
+            )
 
         y = y_ssm * F.silu(z)
         y = self.out_proj(y)
