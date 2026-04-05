@@ -175,12 +175,11 @@ def build_wds_loader(shards_url, batch_size, flags=None, is_training=True):
 
     dataset = (
         wds.WebDataset(shards_url, resampled=True, nodesplitter=nodesplitter)
-        .shuffle(2000 if is_training else 0)  # Larger shuffle buffer
+        .shuffle(2000 if is_training else 0)
         .decode("pil")
         .to_tuple("jpg;png", "cls")
         .map(apply_transforms)
         .batched(batch_size, partial=False)
-        .prefetch(512)  # Keep buffer full — prevents TPU idle stalls
     )
 
     if is_training:
