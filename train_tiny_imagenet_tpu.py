@@ -311,4 +311,12 @@ def parse_args():
 
 if __name__ == '__main__':
     flags = parse_args()
-    xmp.spawn(_mp_fn, args=(flags,), nprocs=None, start_method='fork')
+    # Compatibility: try new torch_xla.launch API (Colab free TPU, torch_xla>=2.4)
+    # then fall back to xmp.spawn (dedicated TPU VMs, torch_xla<=2.3)
+    try:
+        import torch_xla as xla
+        xla.launch(_mp_fn, args=(flags,))
+    except AttributeError:
+        # Older torch_xla on dedicated VMs — use xmp.spawn
+        xmp.spawn(_mp_fn, args=(flags,), nprocs=None, start_method='fork')
+
