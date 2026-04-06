@@ -311,4 +311,4 @@ def parse_args():
 
 if __name__ == '__main__':
     flags = parse_args()
-    xmp.spawn(_mp_fn, args=(flags,), nprocs=8, start_method='fork')
+    xmp.spawn(_mp_fn, args=(flags,), nprocs=None, start_method='fork')
