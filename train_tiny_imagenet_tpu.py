@@ -191,7 +191,7 @@ def train_model(name, model, train_loader, val_loader, cfg, device):
 # ─────────────────────────────────────────────────────────
 #  XLA Worker Function
 # ─────────────────────────────────────────────────────────
-def _mp_fn(index, flags):
+def _mp_fn(index, flags, ds):
     device = xm.xla_device()
     torch.manual_seed(flags.seed)
     np.random.seed(flags.seed)
@@ -204,9 +204,7 @@ def _mp_fn(index, flags):
     xm.master_print(f"  V2: State-preserving diffusion (per-S, F.conv2d)")
     xm.master_print(f"{'='*60}\n")
 
-    # ── Dataset ──────────────────────────────────────────
-    xm.master_print("  [Loading Tiny-ImageNet via HuggingFace...]")
-    ds = load_dataset("Maysee/tiny-imagenet", trust_remote_code=True)
+    # ── Dataset (pre-loaded in main process, passed via args) ──
 
     mean = [0.485, 0.456, 0.406]
     std  = [0.229, 0.224, 0.225]
@@ -311,12 +309,13 @@ def parse_args():
 
 if __name__ == '__main__':
     flags = parse_args()
-    # Compatibility: try new torch_xla.launch API (Colab free TPU, torch_xla>=2.4)
-    # then fall back to xmp.spawn (dedicated TPU VMs, torch_xla<=2.3)
-    try:
-        import torch_xla as xla
-        xla.launch(_mp_fn, args=(flags,))
-    except AttributeError:
-        # Older torch_xla on dedicated VMs — use xmp.spawn
-        xmp.spawn(_mp_fn, args=(flags,), nprocs=None, start_method='fork')
+
+    # ── Load dataset ONCE in main process to avoid 4-way HuggingFace cache deadlock ──
+    print("[Main] Loading Tiny-ImageNet via HuggingFace (once)...")
+    ds = load_dataset("Maysee/tiny-imagenet", trust_remote_code=True)
+    print(f"[Main] Dataset loaded: {len(ds['train'])} train / {len(ds['valid'])} val samples.")
+    print("[Main] Spawning TPU workers...")
+
+    # Always use xmp.spawn on dedicated TPU VMs
+    xmp.spawn(_mp_fn, args=(flags, ds), nprocs=None, start_method='fork')
 
