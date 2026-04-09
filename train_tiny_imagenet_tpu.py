@@ -88,11 +88,19 @@ class TinyImageNetDataset(torch.utils.data.Dataset):
 # ─────────────────────────────────────────────────────────
 #  Training & Evaluation (XLA-optimized)
 # ─────────────────────────────────────────────────────────
-def train_one_epoch(model, loader, optimizer, criterion, device, cfg):
+def train_one_epoch(model, train_loader_raw, train_sampler, optimizer, criterion, device, cfg, epoch):
     model.train()
+    train_sampler.set_epoch(epoch)  # Shuffle differently each epoch
+
+    # Fresh ParallelLoader each epoch (it's a one-shot iterator)
+    para_loader = pl.ParallelLoader(train_loader_raw, [device])
+    loader = para_loader.per_device_loader(device)
+
     tracker = xm.RateTracker()
     t0 = time.time()
-    total_steps = len(loader)
+    total_steps = len(train_loader_raw)
+    running_correct = torch.tensor(0, dtype=torch.long, device=device)
+    running_total = torch.tensor(0, dtype=torch.long, device=device)
 
     for step, (imgs, labels) in enumerate(loader):
         optimizer.zero_grad()
@@ -102,7 +110,10 @@ def train_one_epoch(model, loader, optimizer, criterion, device, cfg):
         xm.optimizer_step(optimizer)
         tracker.add(cfg.batch_size)
 
-        # Print every 50 steps — use xm.add_step_closure to avoid blocking
+        # Accumulate on-device (no .item() sync!)
+        running_correct += (outs.argmax(1) == labels).sum()
+        running_total += labels.size(0)
+
         if step % 50 == 0:
             xm.add_step_closure(
                 lambda s=step, l=loss: xm.master_print(
@@ -111,13 +122,19 @@ def train_one_epoch(model, loader, optimizer, criterion, device, cfg):
                 )
             )
 
-    # Sync metrics ONCE at end of epoch (not every step)
-    return 0.0, 0.0, time.time() - t0
+    # Single sync at epoch end
+    tr_acc = 100.0 * running_correct.item() / max(running_total.item(), 1)
+    return tr_acc, time.time() - t0
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device):
+def evaluate(model, val_loader_raw, criterion, device):
     model.eval()
+
+    # Fresh ParallelLoader for eval
+    para_loader = pl.ParallelLoader(val_loader_raw, [device])
+    loader = para_loader.per_device_loader(device)
+
     correct_total = torch.tensor(0, dtype=torch.long, device=device)
     count_total = torch.tensor(0, dtype=torch.long, device=device)
 
@@ -128,10 +145,10 @@ def evaluate(model, loader, criterion, device):
 
     # Single sync at end
     acc = 100.0 * correct_total.item() / max(count_total.item(), 1)
-    return 0.0, acc
+    return acc
 
 
-def train_model(name, model, train_loader, val_loader, cfg, device):
+def train_model(name, model, train_loader_raw, train_sampler, val_loader_raw, cfg, device):
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     xm.master_print(f"\n{'='*60}")
     xm.master_print(f"  Training: {name}")
@@ -158,14 +175,13 @@ def train_model(name, model, train_loader, val_loader, cfg, device):
 
     best_acc = 0.0
     for ep in range(1, cfg.epochs + 1):
-        tr_loss, tr_acc, t_ep = train_one_epoch(
-            model, train_loader, optimizer, criterion, device, cfg)
+        tr_acc, t_ep = train_one_epoch(
+            model, train_loader_raw, train_sampler, optimizer, criterion, device, cfg, ep)
 
-        # Aggregate train metrics across TPU cores
-        tr_loss_g = xm.mesh_reduce("tr_loss", tr_loss, lambda x: sum(x)/len(x))
-        tr_acc_g  = xm.mesh_reduce("tr_acc",  tr_acc,  lambda x: sum(x)/len(x))
+        # Aggregate train acc across TPU cores
+        tr_acc_g = xm.mesh_reduce("tr_acc", tr_acc, lambda x: sum(x)/len(x))
 
-        vl_loss, vl_acc = evaluate(model, val_loader, criterion, device)
+        vl_acc = evaluate(model, val_loader_raw, criterion, device)
         vl_acc_g = xm.mesh_reduce("vl_acc", vl_acc, lambda x: sum(x)/len(x))
 
         scheduler.step()
@@ -181,7 +197,7 @@ def train_model(name, model, train_loader, val_loader, cfg, device):
             f"Time {t_ep:4.1f}s | LR {scheduler.get_last_lr()[0]:.2e}"
         )
 
-    xm.master_print(f"\n  ✓ Best Val Acc: {best_acc:.2f}%\n")
+    xm.master_print(f"\n  \u2713 Best Val Acc: {best_acc:.2f}%\n")
     return best_acc
 
 
@@ -251,8 +267,8 @@ def _mp_fn(index, flags):
     )
 
     # Wrap with XLA ParallelLoader for async device transfer
-    train_loader = pl.ParallelLoader(train_loader_raw, [device]).per_device_loader(device)
-    val_loader   = pl.ParallelLoader(val_loader_raw,   [device]).per_device_loader(device)
+    # NOTE: Do NOT wrap here — ParallelLoader is a one-shot iterator.
+    # train_model() creates a fresh ParallelLoader each epoch.
 
     # ── Config ───────────────────────────────────────────
     setattr(flags, 'canvas_size', flags.img_size)
@@ -262,14 +278,14 @@ def _mp_fn(index, flags):
     if flags.mode in ('v1', 'compare'):
         model_v1 = CSMamba_V1(flags).to(device)
         results['CSMamba_V1'] = train_model(
-            'CSMamba_V1', model_v1, train_loader, val_loader, flags, device)
+            'CSMamba_V1', model_v1, train_loader_raw, train_sampler, val_loader_raw, flags, device)
         del model_v1
         xm.mark_step()
 
     if flags.mode in ('v2', 'compare'):
         model_v2 = CSMamba_V2(flags).to(device)
         results['CSMamba_V2'] = train_model(
-            'CSMamba_V2', model_v2, train_loader, val_loader, flags, device)
+            'CSMamba_V2', model_v2, train_loader_raw, train_sampler, val_loader_raw, flags, device)
         del model_v2
         xm.mark_step()
 
