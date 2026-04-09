@@ -191,11 +191,11 @@ def train_model(name, model, train_loader, val_loader, cfg, device):
 # ─────────────────────────────────────────────────────────
 #  XLA Worker Function
 # ─────────────────────────────────────────────────────────
-def _mp_fn(index, flags, ds):
+def _mp_fn(index, flags):
     device = xm.xla_device()
-    torch.manual_seed(flags.seed)
-    np.random.seed(flags.seed)
-    random.seed(flags.seed)
+    torch.manual_seed(flags.seed + index)
+    np.random.seed(flags.seed + index)
+    random.seed(flags.seed + index)
 
     xm.master_print(f"\n{'='*60}")
     xm.master_print(f"  CS-Mamba V1 vs V2 — Tiny-ImageNet-200 Ablation (TPU)")
@@ -204,7 +204,9 @@ def _mp_fn(index, flags, ds):
     xm.master_print(f"  V2: State-preserving diffusion (per-S, F.conv2d)")
     xm.master_print(f"{'='*60}\n")
 
-    # ── Dataset (pre-loaded in main process, passed via args) ──
+    # ── Dataset: each spawned process reads from HF cache independently ──
+    xm.master_print("  [Loading Tiny-ImageNet from HuggingFace cache...]")
+    ds = load_dataset("Maysee/tiny-imagenet", trust_remote_code=True)
 
     mean = [0.485, 0.456, 0.406]
     std  = [0.229, 0.224, 0.225]
@@ -310,12 +312,12 @@ def parse_args():
 if __name__ == '__main__':
     flags = parse_args()
 
-    # ── Load dataset ONCE in main process to avoid 4-way HuggingFace cache deadlock ──
-    print("[Main] Loading Tiny-ImageNet via HuggingFace (once)...")
-    ds = load_dataset("Maysee/tiny-imagenet", trust_remote_code=True)
-    print(f"[Main] Dataset loaded: {len(ds['train'])} train / {len(ds['valid'])} val samples.")
-    print("[Main] Spawning TPU workers...")
+    # Pre-download dataset in main process so all spawned workers hit the local cache
+    print("[Main] Pre-fetching Tiny-ImageNet to local HuggingFace cache...")
+    load_dataset("Maysee/tiny-imagenet", trust_remote_code=True)
+    print("[Main] Dataset cached. Spawning TPU workers with start_method='spawn'...")
 
-    # Always use xmp.spawn on dedicated TPU VMs
-    xmp.spawn(_mp_fn, args=(flags, ds), nprocs=None, start_method='fork')
+    # Use 'spawn' (not 'fork') — required for PJRT-based torch_xla on TPU VMs
+    # 'fork' inherits parent mutex state and breaks the PJRT process pool
+    xmp.spawn(_mp_fn, args=(flags,), nprocs=None, start_method='spawn')
 
