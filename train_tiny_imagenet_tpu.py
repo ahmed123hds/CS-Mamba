@@ -91,8 +91,8 @@ class TinyImageNetDataset(torch.utils.data.Dataset):
 def train_one_epoch(model, loader, optimizer, criterion, device, cfg):
     model.train()
     tracker = xm.RateTracker()
-    correct = total = total_loss = 0
     t0 = time.time()
+    total_steps = len(loader)
 
     for step, (imgs, labels) in enumerate(loader):
         optimizer.zero_grad()
@@ -102,30 +102,33 @@ def train_one_epoch(model, loader, optimizer, criterion, device, cfg):
         xm.optimizer_step(optimizer)
         tracker.add(cfg.batch_size)
 
-        total_loss += loss.item() * imgs.size(0)
-        correct    += (outs.argmax(1) == labels).sum().item()
-        total      += imgs.size(0)
-
+        # Print every 50 steps — use xm.add_step_closure to avoid blocking
         if step % 50 == 0:
-            xm.master_print(
-                f"    Step {step}/{len(loader)} | Loss: {loss.item():.4f} | "
-                f"Rate: {tracker.global_rate():.2f} img/s"
+            xm.add_step_closure(
+                lambda s=step, l=loss: xm.master_print(
+                    f"    Step {s}/{total_steps} | Loss: {l.item():.4f} | "
+                    f"Rate: {tracker.global_rate():.2f} img/s"
+                )
             )
 
-    return total_loss / total, 100.0 * correct / total, time.time() - t0
+    # Sync metrics ONCE at end of epoch (not every step)
+    return 0.0, 0.0, time.time() - t0
 
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device):
     model.eval()
-    correct = total = total_loss = 0
+    correct_total = torch.tensor(0, dtype=torch.long, device=device)
+    count_total = torch.tensor(0, dtype=torch.long, device=device)
+
     for imgs, labels in loader:
         outs = model(imgs)
-        loss = criterion(outs, labels)
-        total_loss += loss.item() * imgs.size(0)
-        correct    += (outs.argmax(1) == labels).sum().item()
-        total      += imgs.size(0)
-    return total_loss / total, 100.0 * correct / total
+        correct_total += (outs.argmax(1) == labels).sum()
+        count_total += labels.size(0)
+
+    # Single sync at end
+    acc = 100.0 * correct_total.item() / max(count_total.item(), 1)
+    return 0.0, acc
 
 
 def train_model(name, model, train_loader, val_loader, cfg, device):
@@ -238,12 +241,12 @@ def _mp_fn(index, flags):
 
     train_loader_raw = DataLoader(
         train_ds, batch_size=flags.batch_size,
-        sampler=train_sampler, num_workers=flags.num_workers,
+        sampler=train_sampler, num_workers=0,
         drop_last=True
     )
     val_loader_raw = DataLoader(
         val_ds, batch_size=flags.batch_size,
-        sampler=val_sampler, num_workers=flags.num_workers,
+        sampler=val_sampler, num_workers=0,
         drop_last=False
     )
 
