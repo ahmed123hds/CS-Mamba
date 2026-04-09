@@ -95,15 +95,9 @@ def train_one_epoch(model, loader, optimizer, criterion, device, cfg):
     t0 = time.time()
 
     for step, (imgs, labels) in enumerate(loader):
-        use_mixup = random.random() < 0.5
-        if use_mixup:
-            imgs, y_a, y_b, lam = mixup_data(imgs, labels, alpha=0.8)
-        else:
-            imgs, y_a, y_b, lam = cutmix_data(imgs, labels, alpha=1.0)
-
         optimizer.zero_grad()
         outs = model(imgs)
-        loss = mixup_criterion(criterion, outs, y_a, y_b, lam)
+        loss = criterion(outs, labels)
         loss.backward()
         xm.optimizer_step(optimizer)
         tracker.add(cfg.batch_size)
@@ -218,7 +212,7 @@ def _mp_fn(index, flags):
         transforms.ColorJitter(0.4, 0.4, 0.4),
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
-        transforms.RandomErasing(p=0.25, scale=(0.02, 0.2)),
+        # NOTE: RandomErasing removed — dynamic mask shapes cause XLA recompilation
     ])
     transform_val = transforms.Compose([
         transforms.ToTensor(),
