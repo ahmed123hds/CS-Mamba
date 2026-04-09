@@ -311,7 +311,9 @@ if __name__ == '__main__':
     load_dataset("Maysee/tiny-imagenet", trust_remote_code=True)
     print("[Main] Dataset cached. Spawning TPU workers with start_method='spawn'...")
 
-    # Use 'spawn' (not 'fork') — required for PJRT-based torch_xla on TPU VMs
-    # 'fork' inherits parent mutex state and breaks the PJRT process pool
-    xmp.spawn(_mp_fn, args=(flags,), nprocs=None, start_method='spawn')
+    # Use 'fork' — inherits parent's /dev/accel0 TPU device permissions
+    # Original fork issues (deadlock, slow training) were caused by:
+    #   1. HuggingFace lock contention (fixed: pre-cached in main)
+    #   2. CutMix dynamic shapes (fixed: removed from training loop)
+    xmp.spawn(_mp_fn, args=(flags,), nprocs=None, start_method='fork')
 
