@@ -200,7 +200,7 @@ def _mp_fn(index, flags):
 
     # ── Dataset: each spawned process reads from HF cache independently ──
     xm.master_print("  [Loading Tiny-ImageNet from HuggingFace cache...]")
-    ds = load_dataset("Maysee/tiny-imagenet", trust_remote_code=True)
+    ds = load_dataset("Maysee/tiny-imagenet")
 
     mean = [0.485, 0.456, 0.406]
     std  = [0.229, 0.224, 0.225]
@@ -308,7 +308,7 @@ if __name__ == '__main__':
 
     # Pre-download dataset in main process so all spawned workers hit the local cache
     print("[Main] Pre-fetching Tiny-ImageNet to local HuggingFace cache...")
-    load_dataset("Maysee/tiny-imagenet", trust_remote_code=True)
+    load_dataset("Maysee/tiny-imagenet")
     print("[Main] Dataset cached. Spawning TPU workers with start_method='spawn'...")
 
     # Use 'fork' — inherits parent's /dev/accel0 TPU device permissions
