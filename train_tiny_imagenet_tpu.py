@@ -33,6 +33,7 @@ import torch_xla.distributed.parallel_loader as pl
 from models.continuous_spatial_mamba import ContinuousSpatialMambaClassifier as CSMamba_V1
 from models.continuous_spatial_mamba_v2 import CSMamba_V2
 from models.continuous_spatial_mamba_v3 import CSMamba_V3
+from models.continuous_spatial_mamba_v4 import CSMamba_V4
 
 
 # ─────────────────────────────────────────────────────────
@@ -297,6 +298,13 @@ def _mp_fn(index, flags):
         del model_v3
         xm.mark_step()
 
+    if flags.mode in ('v4', 'compare'):
+        model_v4 = CSMamba_V4(flags).to(device)
+        results['CSMamba_V4'] = train_model(
+            'CSMamba_V4', model_v4, train_loader_raw, train_sampler, val_loader_raw, flags, device)
+        del model_v4
+        xm.mark_step()
+
     if len(results) > 1:
         xm.master_print(f"\n{'='*60}")
         xm.master_print(f"  FINAL COMPARISON — Tiny-ImageNet-200")
@@ -312,8 +320,8 @@ def _mp_fn(index, flags):
 #  Args & Entry
 # ─────────────────────────────────────────────────────────
 def parse_args():
-    p = argparse.ArgumentParser("CS-Mamba V1 vs V2 vs V3 — Tiny-ImageNet (TPU)")
-    p.add_argument('--mode',           choices=['v1', 'v2', 'v3', 'compare'], default='v3')
+    p = argparse.ArgumentParser("CS-Mamba V1/V2/V3/V4 — Tiny-ImageNet (TPU)")
+    p.add_argument('--mode',           choices=['v1', 'v2', 'v3', 'v4', 'compare'], default='v3')
     p.add_argument('--img_size',       type=int,   default=64)
     p.add_argument('--patch_size',     type=int,   default=4)
     p.add_argument('--n_classes',      type=int,   default=200)
