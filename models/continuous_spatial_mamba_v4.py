@@ -51,7 +51,7 @@ class DropPath(nn.Module):
 
 # ── Complex Schrödinger PDE Forward ─────────────────────────
 def cs_mamba_forward_v4(h0_real, h0_imag, x, delta_s, delta_d, A, B_mat,
-                         diffusion_conv, reaction_gate, reaction_proj,
+                         diffusion_conv, reaction_alpha, reaction_beta,
                          K, H, W, mamba_input=None):
     """
     Complex Schrödinger Reaction-Diffusion PDE Integration.
@@ -69,8 +69,8 @@ def cs_mamba_forward_v4(h0_real, h0_imag, x, delta_s, delta_d, A, B_mat,
         A:                (D, S) state decay matrix
         B_mat:            (B, N, S) input projection
         diffusion_conv:   nn.Conv2d — learned spatial operator
-        reaction_gate:    nn.Linear — gate for reaction
-        reaction_proj:    nn.Linear — projection for reaction
+        reaction_alpha:   (1, 1, D, 1) reaction alpha coefficient
+        reaction_beta:    (1, 1, D, 1) reaction beta coefficient
         K:                int, Euler steps
         H, W:             spatial grid dimensions
     """
@@ -111,14 +111,11 @@ def cs_mamba_forward_v4(h0_real, h0_imag, x, delta_s, delta_d, A, B_mat,
         f2_real = delta_d.unsqueeze(-1) * (-lap_imag)  # ← imag feeds real
         f2_imag = delta_d.unsqueeze(-1) * (+lap_real)  # ← real feeds imag
 
-        # ── Force 3: Nonlinear Reaction on Magnitude ─────────────
-        # The reaction operates on |ψ| = sqrt(real² + imag²)
-        # This creates patterns based on the "energy" landscape
+        # ── Force 3: Nonlinear Reaction (Allen-Cahn) ─────────────
+        # The reaction operates on magnitude |ψ| = sqrt(real² + imag²)
+        # R(|ψ|) = α·|ψ| - β·|ψ|³
         magnitude = torch.sqrt(h_real ** 2 + h_imag ** 2 + 1e-8)
-        mag_flat = magnitude.reshape(B_val * N, D_dim * S_dim)
-        gate = torch.sigmoid(reaction_gate(mag_flat))
-        reaction = gate * reaction_proj(mag_flat)
-        reaction = reaction.reshape(B_val, N, D_dim, S_dim)
+        reaction = reaction_alpha * magnitude - reaction_beta * (magnitude ** 3)
 
         # Reaction modulates both components proportionally to their phase
         # Phase-preserving: reaction * (h / |h|)  ≈  reaction * sign(h)
@@ -189,14 +186,10 @@ class ContinuousSpatialSSM_V4(nn.Module):
             ).view(1, 1, 3, 3) * 0.1
             self.diffusion_conv.weight.copy_(lap_init.repeat(d_inner, 1, 1, 1))
 
-        # ── Reaction Term (operates on magnitude |ψ|) ──
-        reaction_dim = d_inner * d_state
-        self.reaction_gate = nn.Linear(reaction_dim, reaction_dim, bias=True)
-        self.reaction_proj = nn.Linear(reaction_dim, reaction_dim, bias=False)
-        # Start near zero so model begins close to pure Schrödinger dynamics
-        nn.init.zeros_(self.reaction_gate.weight)
-        nn.init.zeros_(self.reaction_gate.bias)
-        nn.init.uniform_(self.reaction_proj.weight, -1e-4, 1e-4)
+        # ── Reaction Term (Allen-Cahn polynomial on |ψ|) ──
+        # Phase separation reaction: α·|ψ| - β·|ψ|³
+        self.reaction_alpha = nn.Parameter(torch.zeros(1, 1, d_inner, 1))
+        self.reaction_beta = nn.Parameter(torch.zeros(1, 1, d_inner, 1))
 
     def forward(self, x: torch.Tensor, K_steps: int = 2, use_triton: bool = False) -> torch.Tensor:
         B_val, N, D_dim = x.shape
@@ -220,7 +213,7 @@ class ContinuousSpatialSSM_V4(nn.Module):
         # Complex PDE Integration
         h_real, h_imag = cs_mamba_forward_v4(
             h0_real, h0_imag, x, delta_self, delta_diff, A_mat, B_mat,
-            self.diffusion_conv, self.reaction_gate, self.reaction_proj,
+            self.diffusion_conv, self.reaction_alpha, self.reaction_beta,
             K_steps, H, W, mamba_input=h0_real
         )
 

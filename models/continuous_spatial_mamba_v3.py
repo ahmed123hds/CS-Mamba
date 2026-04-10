@@ -42,7 +42,7 @@ class DropPath(nn.Module):
 
 # ── Learned Reaction-Diffusion PDE Forward ──────────────────────
 def cs_mamba_forward_v3(h0, x, delta_s, delta_d, A, B_mat, 
-                         diffusion_conv, reaction_gate, reaction_proj,
+                         diffusion_conv, reaction_alpha, reaction_beta,
                          K, H, W, mamba_input=None):
     """
     Learned Reaction-Diffusion PDE Integration.
@@ -59,8 +59,8 @@ def cs_mamba_forward_v3(h0, x, delta_s, delta_d, A, B_mat,
         A:               (D, S) state decay matrix
         B_mat:           (B, N, S) input projection
         diffusion_conv:  nn.Conv2d — learned spatial mixing operator
-        reaction_gate:   nn.Linear — gate for reaction term
-        reaction_proj:   nn.Linear — projection for reaction term
+        reaction_alpha:  (1, 1, D, 1) reaction alpha coefficient
+        reaction_beta:   (1, 1, D, 1) reaction beta coefficient
         K:               int, number of Euler steps
         H, W:            spatial grid dimensions
     """
@@ -90,13 +90,13 @@ def cs_mamba_forward_v3(h0, x, delta_s, delta_d, A, B_mat,
         diff_h = diff_h_2d.reshape(B_val, S_dim, D_dim, N).permute(0, 3, 2, 1)
         force_2 = delta_d.unsqueeze(-1) * diff_h
 
-        # ── Force 3: Nonlinear Reaction ──────────────────────────
-        # Gated MLP creates discriminative patterns instead of just blurring
-        # Acts pointwise on each spatial location
-        h_flat = h.reshape(B_val * N, D_dim * S_dim)
-        gate = torch.sigmoid(reaction_gate(h_flat))
-        reaction = gate * reaction_proj(h_flat)
-        force_3 = reaction.reshape(B_val, N, D_dim, S_dim)
+        # ── Force 3: Nonlinear Reaction (Allen-Cahn) ─────────────
+        # Instead of a heavy MLP (which causes OOM), we use the physics-
+        # informed Allen-Cahn polynomial reaction: R(h) = α·h - β·h³
+        # This is the classic reaction equation for phase separation
+        # and pattern formation, but completely element-wise!
+        reaction = reaction_alpha * h - reaction_beta * (h ** 3)
+        force_3 = reaction
 
         # ── Explicit Euler Step ──────────────────────────────────
         h = h + dt * (force_1 + force_2 + force_3)
@@ -158,15 +158,10 @@ class ContinuousSpatialSSM_V3(nn.Module):
             ).view(1, 1, 3, 3) * 0.1  # Scale down for stability
             self.diffusion_conv.weight.copy_(lap_init.repeat(d_inner, 1, 1, 1))
 
-        # ── Reaction Term (Gated MLP) ──
-        # Projects from (D*S) → (D*S) with a sigmoid gate
-        reaction_dim = d_inner * d_state
-        self.reaction_gate = nn.Linear(reaction_dim, reaction_dim, bias=True)
-        self.reaction_proj = nn.Linear(reaction_dim, reaction_dim, bias=False)
-        # Initialize reaction near zero so model starts close to V2 behavior
-        nn.init.zeros_(self.reaction_gate.weight)
-        nn.init.zeros_(self.reaction_gate.bias)
-        nn.init.uniform_(self.reaction_proj.weight, -1e-4, 1e-4)
+        # ── Reaction Term (Allen-Cahn polynomial) ──
+        # Phase separation reaction: α·h - β·h³
+        self.reaction_alpha = nn.Parameter(torch.zeros(1, 1, d_inner, 1))
+        self.reaction_beta = nn.Parameter(torch.zeros(1, 1, d_inner, 1))
 
     def forward(self, x: torch.Tensor, K_steps: int = 2, use_triton: bool = False) -> torch.Tensor:
         B_val, N, D_dim = x.shape
@@ -185,7 +180,7 @@ class ContinuousSpatialSSM_V3(nn.Module):
 
         h = cs_mamba_forward_v3(
             h0, x, delta_self, delta_diff, A_mat, B_mat,
-            self.diffusion_conv, self.reaction_gate, self.reaction_proj,
+            self.diffusion_conv, self.reaction_alpha, self.reaction_beta,
             K_steps, H, W, mamba_input=h0
         )
 
