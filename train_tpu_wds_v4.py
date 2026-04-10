@@ -183,7 +183,7 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
     else: dataset = dataset.map(apply_stack_val)
 
     return wds.WebLoader(dataset, batch_size=None, num_workers=flags.num_workers,
-                         pin_memory=True, prefetch_factor=4, persistent_workers=True)
+                         pin_memory=True, prefetch_factor=2, persistent_workers=False)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -340,11 +340,9 @@ def _mp_fn(index, flags):
             if step > 0 and step % (50 if is_imagenet else 10) == 0:
                 xm.master_print(f"  E{epoch:03d} | Step {step}/{train_steps} | Loss: {loss.item():.4f} | Rate: {tracker.global_rate():.1f} img/s")
 
-        xm.master_print(f"  [DEBUG] Epoch {epoch} train loop finished. Starting mesh_reduce...")
         train_time = time.time() - t0
         g_loss = xm.mesh_reduce("tr_loss", total_loss, np.sum) / max(xm.mesh_reduce("tr_n", total, np.sum), 1)
         g_acc  = 100.0 * xm.mesh_reduce("tr_c", correct, np.sum) / max(xm.mesh_reduce("tr_n", total, np.sum), 1)
-        xm.master_print(f"  [DEBUG] mesh_reduce finished. Starting validation...")
 
         model.eval()
         v_correct, v_total = 0, 0
