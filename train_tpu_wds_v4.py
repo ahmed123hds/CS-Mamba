@@ -348,6 +348,7 @@ def _mp_fn(index, flags):
 
         model.eval()
         v_correct, v_total = 0, 0
+        t1 = time.time()
 
         for step, batch in enumerate(para_val):
             if step >= val_steps: break
@@ -357,12 +358,13 @@ def _mp_fn(index, flags):
             v_total += images.size(0)
             xm.mark_step()  # <--- CRITICAL: Prevents OOM/hang by compiling graph chunk-by-chunk
 
+        val_time = time.time() - t1
         v_acc = 100.0 * xm.mesh_reduce("v_c", v_correct, np.sum) / max(xm.mesh_reduce("v_n", v_total, np.sum), 1)
         scheduler.step()
 
         xm.master_print(
             f"\n  ═══ Epoch {epoch:03d}/{flags.epochs} | Train {g_acc:.1f}% (loss {g_loss:.4f}) | "
-            f"Val {v_acc:.1f}% | Time {train_time:.0f}s | LR {scheduler.get_last_lr()[0]:.2e} ═══\n"
+            f"Val {v_acc:.1f}% | Train Time {train_time:.0f}s | Val Time {val_time:.0f}s | LR {scheduler.get_last_lr()[0]:.2e} ═══\n"
         )
 
         if v_acc > best_acc:
