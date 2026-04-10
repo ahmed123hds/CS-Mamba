@@ -111,16 +111,14 @@ def cs_mamba_forward_v4(h0_real, h0_imag, x, delta_s, delta_d, A, B_mat,
         f2_real = delta_d.unsqueeze(-1) * (-lap_imag)  # ← imag feeds real
         f2_imag = delta_d.unsqueeze(-1) * (+lap_real)  # ← real feeds imag
 
-        # ── Force 3: Nonlinear Reaction (Allen-Cahn) ─────────────
-        # The reaction operates on magnitude |ψ| = sqrt(real² + imag²)
-        # R(|ψ|) = α·|ψ| - β·|ψ|³
-        magnitude = torch.sqrt(h_real ** 2 + h_imag ** 2 + 1e-8)
-        reaction = reaction_alpha * magnitude - reaction_beta * (magnitude ** 3)
+        # ── Force 3: Nonlinear Reaction (Ginzburg-Landau) ─────────────
+        # Ginzburg-Landau equation for complex scalar fields: R(ψ) = ψ·(α - β|ψ|²)
+        # This completely avoids sqrt() and division, preventing XLA compiler OOM!
+        mag_sq = h_real ** 2 + h_imag ** 2
+        reaction_scale = reaction_alpha - reaction_beta * mag_sq
 
-        # Reaction modulates both components proportionally to their phase
-        # Phase-preserving: reaction * (h / |h|)  ≈  reaction * sign(h)
-        f3_real = reaction * (h_real / (magnitude + 1e-8))
-        f3_imag = reaction * (h_imag / (magnitude + 1e-8))
+        f3_real = h_real * reaction_scale
+        f3_imag = h_imag * reaction_scale
 
         # ── Explicit Euler Step ──────────────────────────────────
         h_real = h_real + dt * (f1_real + f2_real + f3_real)
@@ -186,8 +184,8 @@ class ContinuousSpatialSSM_V4(nn.Module):
             ).view(1, 1, 3, 3) * 0.1
             self.diffusion_conv.weight.copy_(lap_init.repeat(d_inner, 1, 1, 1))
 
-        # ── Reaction Term (Allen-Cahn polynomial on |ψ|) ──
-        # Phase separation reaction: α·|ψ| - β·|ψ|³
+        # ── Reaction Term (Ginzburg-Landau on |ψ|²) ──
+        # Phase separation reaction: ψ·(α - β|ψ|²)
         self.reaction_alpha = nn.Parameter(torch.zeros(1, 1, d_inner, 1))
         self.reaction_beta = nn.Parameter(torch.zeros(1, 1, d_inner, 1))
 
