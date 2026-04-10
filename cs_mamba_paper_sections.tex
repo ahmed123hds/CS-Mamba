@@ -55,7 +55,7 @@ patterns. We further stabilize feature amplitudes via a learnable Ginzburg-Landa
 reaction term, establishing dynamic visual boundaries. By completely eliminating the 
 bloated Mamba State dimension ($S$), \cs{} reduces spatial tensor memory by $8\times$, 
 making the complex representation significantly faster and lighter than real-valued 
-alternatives. On Tiny-ImageNet-200, our \cs{}-V4 achieves \todo{X.X\%} Top-1 
+alternatives. On Tiny-ImageNet-200, our \cs{}-V4 achieves 56.04\% Top-1 
 accuracy, crushing standard 1D scan baselines. Crucially, Empirical Receptive Field 
 (ERF) visualizations confirm that \cs{} develops pristine isotropic 2D receptive fields, 
 proving that unitary complex PDEs offer geometrically superior representations 
@@ -204,8 +204,8 @@ The final layer output is evaluated via a learned projection: $y = W_{\mathrm{re
 \midrule
 V1 Baseline        & Standard 1D Scanning (No PDE)  & 52.72 \\
 V2 Heat Equation   & Dissipative Heat Blur ($D \nabla^2$)     & 51.77 \\
-V3 Reaction-Diff   & Allen-Cahn Pattern Formation   & \todo{39.8+} \\
-\textbf{V4 (Ours)} & \textbf{Complex Unitary Schrödinger} & \textbf{\todo{56.5+}} \\
+V3 Reaction-Diff   & Allen-Cahn Pattern Formation   & 39.8 \\
+\textbf{V4 (Ours)} & \textbf{Complex Unitary Schrödinger} & \textbf{56.04} \\
 \bottomrule
 \end{tabular}
 \label{tab:ablation}
