@@ -168,10 +168,10 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
         labels = labels.long() if isinstance(labels, torch.Tensor) else torch.tensor(labels, dtype=torch.long)
         return images, labels
 
-    nodesplitter = wds.split_by_node if flags.multi_host else wds.split_by_worker
-
+    # When resampled=True is used, WebDataset natively splits workers and nodes infinitely!
+    # Using a custom nodesplitter with resampled=True causes a known hang issue at epoch boundaries.
     dataset = (
-        wds.WebDataset(shards_url, resampled=True, nodesplitter=nodesplitter)
+        wds.WebDataset(shards_url, resampled=True, nodesplitter=None)
         .shuffle(5000 if is_training else 0)
         .decode("pil")
         .to_tuple("jpg;png", "cls")
@@ -340,9 +340,11 @@ def _mp_fn(index, flags):
             if step > 0 and step % (50 if is_imagenet else 10) == 0:
                 xm.master_print(f"  E{epoch:03d} | Step {step}/{train_steps} | Loss: {loss.item():.4f} | Rate: {tracker.global_rate():.1f} img/s")
 
+        xm.master_print(f"  [DEBUG] Epoch {epoch} train loop finished. Starting mesh_reduce...")
         train_time = time.time() - t0
         g_loss = xm.mesh_reduce("tr_loss", total_loss, np.sum) / max(xm.mesh_reduce("tr_n", total, np.sum), 1)
         g_acc  = 100.0 * xm.mesh_reduce("tr_c", correct, np.sum) / max(xm.mesh_reduce("tr_n", total, np.sum), 1)
+        xm.master_print(f"  [DEBUG] mesh_reduce finished. Starting validation...")
 
         model.eval()
         v_correct, v_total = 0, 0
@@ -353,6 +355,7 @@ def _mp_fn(index, flags):
             with torch.no_grad(): logits = model(images)
             v_correct += logits.argmax(1).eq(labels).sum().item()
             v_total += images.size(0)
+            xm.mark_step()  # <--- CRITICAL: Prevents OOM/hang by compiling graph chunk-by-chunk
 
         v_acc = 100.0 * xm.mesh_reduce("v_c", v_correct, np.sum) / max(xm.mesh_reduce("v_n", v_total, np.sum), 1)
         scheduler.step()
