@@ -374,8 +374,7 @@ if __name__ == '__main__':
     flags = parse_args()
     if flags.dataset == 'tiny-imagenet':
         from datasets import load_dataset
-        if xm.is_master_ordinal():
-            print("[Main] Pre-fetching Tiny-ImageNet cache...")
-            load_dataset("Maysee/tiny-imagenet")
+        print("[Main] Pre-fetching Tiny-ImageNet cache...")
+        load_dataset("Maysee/tiny-imagenet")
 
     xmp.spawn(_mp_fn, args=(flags,), nprocs=None, start_method='fork')
