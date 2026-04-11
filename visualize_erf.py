@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import math
 
-from models.continuous_spatial_mamba import CSMamba as CSMamba_V1
+from models.continuous_spatial_mamba import ContinuousSpatialMambaClassifier as CSMamba_V1
 from models.continuous_spatial_mamba_v3 import CSMamba_V3
 from models.continuous_spatial_mamba_v4 import CSMamba_V4
 
