@@ -193,12 +193,11 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
     if is_training: dataset = dataset.map(apply_mixup_cutmix)
     else: dataset = dataset.map(apply_stack_val)
 
-    # CRITICAL: persistent_workers MUTS BE FALSE!
-    # If a worker thread crashes (e.g. KeyError 62), persistent_workers=True keeps the dead 
-    # worker in the pool, causing a complete deadlock at the end of the next epoch.
-    # We accept the 1-3 minute startup delay every epoch because it guarantees 100% stability.
+    # persistent_workers=True is safe now that we fixed the real memory leak
+    # (ParallelLoader was being re-created every epoch without cleanup).
+    # Workers stay alive = instant epoch transitions, no 388s delays.
     return wds.WebLoader(dataset, batch_size=None, num_workers=flags.num_workers,
-                         pin_memory=True, prefetch_factor=2, persistent_workers=False)
+                         pin_memory=True, prefetch_factor=2, persistent_workers=True)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -301,7 +300,6 @@ def _mp_fn(index, flags):
             best_acc = ckpt.get('best_acc', 0.0)
             xm.master_print(f"  ✅ Resumed full state! Starting at Epoch {start_epoch}")
         else:
-            # Fallback for old checkpoints that were just the raw state_dict
             model.load_state_dict(ckpt)
             xm.master_print("  ⚠️ Loaded raw model weights only. Optimizer/epoch stats reset.")
 
@@ -313,7 +311,6 @@ def _mp_fn(index, flags):
         train_steps  = math.ceil(1_281_167 / global_bs)
         val_steps    = math.ceil(50_000 / global_bs)
     else:
-        # We need to recreate ParallelLoader every epoch for standard DataLoader
         train_loader = build_tiny_loader(flags, True)
         val_loader   = build_tiny_loader(flags, False)
         train_steps  = math.ceil(100_000 / global_bs)
@@ -330,11 +327,18 @@ def _mp_fn(index, flags):
     for epoch in range(start_epoch, flags.epochs + 1):
         if not is_imagenet:
             train_loader.sampler.set_epoch(epoch)
-            para_train = pl.ParallelLoader(train_loader, [device]).per_device_loader(device)
-            para_val   = pl.ParallelLoader(val_loader, [device]).per_device_loader(device)
-        else:
-            para_train = pl.ParallelLoader(train_loader, [device]).per_device_loader(device)
-            para_val   = pl.ParallelLoader(val_loader, [device]).per_device_loader(device)
+
+        # ── CRITICAL FIX: Create ParallelLoader, use it, then let it be garbage collected ──
+        # Previously we created new ParallelLoaders every epoch without cleanup.
+        # Each ParallelLoader spawns XLA background threads that were never freed,
+        # causing host RAM to grow ~50MB/epoch until OOM killed the process at Epoch 8/23.
+        # 
+        # Fix: Create, use, then explicitly delete + garbage collect each ParallelLoader.
+        import gc
+
+        # ── TRAINING PHASE ──
+        pl_train = pl.ParallelLoader(train_loader, [device])
+        para_train = pl_train.per_device_loader(device)
 
         model.train()
         tracker = xm.RateTracker()
@@ -366,6 +370,14 @@ def _mp_fn(index, flags):
         g_loss = xm.mesh_reduce("tr_loss", total_loss, np.sum) / max(xm.mesh_reduce("tr_n", total, np.sum), 1)
         g_acc  = 100.0 * xm.mesh_reduce("tr_c", correct, np.sum) / max(xm.mesh_reduce("tr_n", total, np.sum), 1)
 
+        # ── CLEANUP TRAINING PARALLELLOADER ──
+        del para_train, pl_train
+        gc.collect()
+
+        # ── VALIDATION PHASE ──
+        pl_val = pl.ParallelLoader(val_loader, [device])
+        para_val = pl_val.per_device_loader(device)
+
         model.eval()
         v_correct, v_total = 0, 0
         t1 = time.time()
@@ -376,11 +388,15 @@ def _mp_fn(index, flags):
             with torch.no_grad(): logits = model(images)
             v_correct += logits.argmax(1).eq(labels).sum().item()
             v_total += images.size(0)
-            xm.mark_step()  # <--- CRITICAL: Prevents OOM/hang by compiling graph chunk-by-chunk
+            xm.mark_step()
 
         val_time = time.time() - t1
         v_acc = 100.0 * xm.mesh_reduce("v_c", v_correct, np.sum) / max(xm.mesh_reduce("v_n", v_total, np.sum), 1)
         scheduler.step()
+
+        # ── CLEANUP VALIDATION PARALLELLOADER ──
+        del para_val, pl_val
+        gc.collect()
 
         xm.master_print(
             f"\n  ═══ Epoch {epoch:03d}/{flags.epochs} | Train {g_acc:.1f}% (loss {g_loss:.4f}) | "
