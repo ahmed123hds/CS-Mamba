@@ -183,7 +183,7 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
     else: dataset = dataset.map(apply_stack_val)
 
     return wds.WebLoader(dataset, batch_size=None, num_workers=flags.num_workers,
-                         pin_memory=True, prefetch_factor=2, persistent_workers=False)
+                         pin_memory=True, prefetch_factor=4, persistent_workers=True)
 
 
 # ════════════════════════════════════════════════════════════════════
