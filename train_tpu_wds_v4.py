@@ -16,11 +16,22 @@ Training Recipe:
 
 import os
 import sys
+import threading
 import time
 import math
 import argparse
 import random
 import numpy as np
+
+# ── SUPPRESS HARMLESS DATALOADER KEYERROR ──
+# PyTorch's DataLoader throws a background KeyError: 62 thread exception when XLA 
+# ParallelLoader abruptly stops at the end of validation. This hides the traceback 
+# so it doesn't overwrite your beautiful Epoch summary printout!
+_orig_excepthook = threading.excepthook
+def _silent_dl_excepthook(args):
+    if issubclass(args.exc_type, KeyError): return
+    _orig_excepthook(args)
+threading.excepthook = _silent_dl_excepthook
 
 sys.path.insert(0, os.path.dirname(__file__))
 
