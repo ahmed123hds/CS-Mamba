@@ -17,6 +17,7 @@ def get_config():
     cfg.img_size = 224
     cfg.patch_size = 16
     cfg.d_embed = 192
+    cfg.d_state = 16
     cfg.n_mamba_layers = 12
     cfg.K_steps = 3
     cfg.n_classes = 1000
@@ -33,11 +34,12 @@ def compute_erf(model_class, device='cuda'):
     target_module = None
     if hasattr(model, 'final_norm'):
         target_module = model.final_norm
+    elif hasattr(model, 'norm'):
+        target_module = model.norm
     elif hasattr(model, 'norm_f'):
         target_module = model.norm_f
     else:
-        # Fallback to the last layer
-        target_module = model.layers[-1]
+        target_module = model.layers[-1] if hasattr(model, 'layers') else model.blocks[-1]
 
     features = []
     def hook(m, i, o):
@@ -49,8 +51,9 @@ def compute_erf(model_class, device='cuda'):
 
     handle = target_module.register_forward_hook(hook)
 
-    # Blank image, requires_grad=True
-    x = torch.zeros(1, 3, 224, 224, requires_grad=True, device=device)
+    # Standard Gaussian noise image, requires_grad=True
+    # (Random noise is required to keep SiLU & LayerNorm gradients from collapsing to zero)
+    x = torch.randn(1, 3, 224, 224, requires_grad=True, device=device)
     
     # Forward pass
     model(x)
