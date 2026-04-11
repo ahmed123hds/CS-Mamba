@@ -277,11 +277,18 @@ def _mp_fn(index, flags):
     if flags.resume:
         xm.master_print(f"📦 Resuming from: {flags.resume}")
         ckpt = torch.load(flags.resume, map_location='cpu')
-        model.load_state_dict(ckpt['state_dict'])
-        optimizer.load_state_dict(ckpt['optimizer'])
-        scheduler.load_state_dict(ckpt['scheduler'])
-        start_epoch = ckpt['epoch'] + 1
-        best_acc = ckpt.get('best_acc', 0.0)
+        
+        if 'state_dict' in ckpt:
+            model.load_state_dict(ckpt['state_dict'])
+            if 'optimizer' in ckpt: optimizer.load_state_dict(ckpt['optimizer'])
+            if 'scheduler' in ckpt: scheduler.load_state_dict(ckpt['scheduler'])
+            start_epoch = ckpt.get('epoch', 0) + 1
+            best_acc = ckpt.get('best_acc', 0.0)
+            xm.master_print(f"  ✅ Resumed full state! Starting at Epoch {start_epoch}")
+        else:
+            # Fallback for old checkpoints that were just the raw state_dict
+            model.load_state_dict(ckpt)
+            xm.master_print("  ⚠️ Loaded raw model weights only. Optimizer/epoch stats reset.")
 
     is_imagenet = flags.dataset == 'imagenet1k'
     
