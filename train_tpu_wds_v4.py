@@ -193,11 +193,12 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
     if is_training: dataset = dataset.map(apply_mixup_cutmix)
     else: dataset = dataset.map(apply_stack_val)
 
-    # persistent_workers=True: workers stay alive across epochs (fast val, no re-seeking tar files).
-    # The original OOM crash was caused by 8 workers × prefetch=4. With num_workers=4 and
-    # prefetch_factor=2, total buffered batches = 4×2 = 8 (vs. 8×4 = 32 before). Safe on memory.
+    # CRITICAL: persistent_workers MUTS BE FALSE!
+    # If a worker thread crashes (e.g. KeyError 62), persistent_workers=True keeps the dead 
+    # worker in the pool, causing a complete deadlock at the end of the next epoch.
+    # We accept the 1-3 minute startup delay every epoch because it guarantees 100% stability.
     return wds.WebLoader(dataset, batch_size=None, num_workers=flags.num_workers,
-                         pin_memory=True, prefetch_factor=2, persistent_workers=True)
+                         pin_memory=True, prefetch_factor=2, persistent_workers=False)
 
 
 # ════════════════════════════════════════════════════════════════════
