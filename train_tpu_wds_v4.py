@@ -193,11 +193,16 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
     if is_training: dataset = dataset.map(apply_mixup_cutmix)
     else: dataset = dataset.map(apply_stack_val)
 
-    # persistent_workers=True is safe now that we fixed the real memory leak
-    # (ParallelLoader was being re-created every epoch without cleanup).
-    # Workers stay alive = instant epoch transitions, no 388s delays.
+    # CRITICAL: persistent_workers MUST BE FALSE for PyTorch XLA!
+    # XLA ParallelLoader creates a background thread. Since we must delete ParallelLoader 
+    # every epoch to prevent memory leaks, that deletion violently breaks the DataLoader's 
+    # active IPC queue. If persistent_workers=True, the worker threads die and cause 
+    # a deadlock exactly like what happened at Epoch 62.
+    # 
+    # persistent_workers=False cleanly rebuilds the threads. The 3-5 minute delay 
+    # per epoch is scientifically required to run ImageNet successfully on TPUs.
     return wds.WebLoader(dataset, batch_size=None, num_workers=flags.num_workers,
-                         pin_memory=True, prefetch_factor=2, persistent_workers=True)
+                         pin_memory=True, prefetch_factor=2, persistent_workers=False)
 
 
 # ════════════════════════════════════════════════════════════════════
