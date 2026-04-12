@@ -193,16 +193,9 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
     if is_training: dataset = dataset.map(apply_mixup_cutmix)
     else: dataset = dataset.map(apply_stack_val)
 
-    # CRITICAL: persistent_workers MUST BE FALSE for PyTorch XLA!
-    # XLA ParallelLoader creates a background thread. Since we must delete ParallelLoader 
-    # every epoch to prevent memory leaks, that deletion violently breaks the DataLoader's 
-    # active IPC queue. If persistent_workers=True, the worker threads die and cause 
-    # a deadlock exactly like what happened at Epoch 62.
-    # 
-    # persistent_workers=False cleanly rebuilds the threads. The 3-5 minute delay 
-    # per epoch is scientifically required to run ImageNet successfully on TPUs.
+    # Use persistent_workers=True because MpDeviceLoader handles lifecycle correctly.
     return wds.WebLoader(dataset, batch_size=None, num_workers=flags.num_workers,
-                         pin_memory=True, prefetch_factor=2, persistent_workers=False)
+                         pin_memory=True, prefetch_factor=2, persistent_workers=True)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -254,6 +247,7 @@ def build_tiny_loader(flags, is_training=True):
     loader = DataLoader(
         dataset, batch_size=flags.batch_size, sampler=sampler, 
         num_workers=flags.num_workers, drop_last=is_training,
+        pin_memory=True, persistent_workers=True,
         collate_fn=mixup_collate if is_training else None
     )
     return loader
@@ -329,21 +323,16 @@ def _mp_fn(index, flags):
     xm.master_print(f"  Grad Clip:    {flags.grad_clip} | Warmup: {flags.warmup_epochs} epochs")
     xm.master_print(f"{'='*70}\n")
 
+    # ── INIT PERSISTENT DEVICE LOADERS ──
+    # MpDeviceLoader wraps the iterable without leaking memory on destruction loop boundaries.
+    para_train = pl.MpDeviceLoader(train_loader, device)
+    para_val = pl.MpDeviceLoader(val_loader, device)
+
     for epoch in range(start_epoch, flags.epochs + 1):
         if not is_imagenet:
             train_loader.sampler.set_epoch(epoch)
 
-        # ── CRITICAL FIX: Create ParallelLoader, use it, then let it be garbage collected ──
-        # Previously we created new ParallelLoaders every epoch without cleanup.
-        # Each ParallelLoader spawns XLA background threads that were never freed,
-        # causing host RAM to grow ~50MB/epoch until OOM killed the process at Epoch 8/23.
-        # 
-        # Fix: Create, use, then explicitly delete + garbage collect each ParallelLoader.
-        import gc
-
         # ── TRAINING PHASE ──
-        pl_train = pl.ParallelLoader(train_loader, [device])
-        para_train = pl_train.per_device_loader(device)
 
         model.train()
         tracker = xm.RateTracker()
@@ -375,13 +364,7 @@ def _mp_fn(index, flags):
         g_loss = xm.mesh_reduce("tr_loss", total_loss, np.sum) / max(xm.mesh_reduce("tr_n", total, np.sum), 1)
         g_acc  = 100.0 * xm.mesh_reduce("tr_c", correct, np.sum) / max(xm.mesh_reduce("tr_n", total, np.sum), 1)
 
-        # ── CLEANUP TRAINING PARALLELLOADER ──
-        del para_train, pl_train
-        gc.collect()
-
         # ── VALIDATION PHASE ──
-        pl_val = pl.ParallelLoader(val_loader, [device])
-        para_val = pl_val.per_device_loader(device)
 
         model.eval()
         v_correct, v_total = 0, 0
@@ -398,10 +381,6 @@ def _mp_fn(index, flags):
         val_time = time.time() - t1
         v_acc = 100.0 * xm.mesh_reduce("v_c", v_correct, np.sum) / max(xm.mesh_reduce("v_n", v_total, np.sum), 1)
         scheduler.step()
-
-        # ── CLEANUP VALIDATION PARALLELLOADER ──
-        del para_val, pl_val
-        gc.collect()
 
         xm.master_print(
             f"\n  ═══ Epoch {epoch:03d}/{flags.epochs} | Train {g_acc:.1f}% (loss {g_loss:.4f}) | "
