@@ -341,12 +341,13 @@ def _mp_fn(index, flags):
 
     autocast_ctx = _maybe_autocast(flags)
 
-    para_train = pl.MpDeviceLoader(train_loader, device)
-    para_val = pl.MpDeviceLoader(val_loader, device)
-
     for epoch in range(start_epoch, flags.epochs + 1):
         if not is_imagenet:
             train_loader.sampler.set_epoch(epoch)
+
+        # ── Create per-epoch ParallelLoader ──
+        pl_train = pl.ParallelLoader(train_loader, [device])
+        para_train = pl_train.per_device_loader(device)
 
         model.train()
         tracker = xm.RateTracker()
@@ -382,6 +383,14 @@ def _mp_fn(index, flags):
         g_loss = xm.mesh_reduce("tr_loss", total_loss, np.sum) / g_total
         g_acc = 100.0 * xm.mesh_reduce("tr_c", total_correct, np.sum) / g_total
 
+        # ── Cleanup train loader ──
+        del para_train, pl_train
+        gc.collect()
+
+        # ── Validation ──
+        pl_val = pl.ParallelLoader(val_loader, [device])
+        para_val = pl_val.per_device_loader(device)
+
         model.eval()
         v_correct, v_total = 0, 0
         t1 = time.time()
@@ -399,6 +408,10 @@ def _mp_fn(index, flags):
         val_time = time.time() - t1
         v_acc = 100.0 * xm.mesh_reduce("v_c", v_correct, np.sum) / max(xm.mesh_reduce("v_n", v_total, np.sum), 1)
         scheduler.step()
+
+        # ── Cleanup val loader ──
+        del para_val, pl_val
+        gc.collect()
 
         xm.master_print(
             f"\nEpoch {epoch:03d}/{flags.epochs} | "
