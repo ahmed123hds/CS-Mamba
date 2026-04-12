@@ -101,17 +101,29 @@ class ExactReactionDiffusion2D(nn.Module):
         scale = torch.sqrt(q_new / q.clamp_min(eps))
         return psi * scale.to(psi.dtype)
 
-    def _exact_diffusion_step(self, psi: torch.Tensor, gamma: torch.Tensor, lap_eigs: torch.Tensor, dt: float) -> torch.Tensor:
+    def _exact_diffusion_step(self, psi_real: torch.Tensor, psi_imag: torch.Tensor, gamma: torch.Tensor, lap_eigs: torch.Tensor, dt: float) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Exact discrete Schrödinger flow for
             d psi / dt = i * gamma * Laplacian(psi)
-        with periodic boundary conditions.
+        with periodic boundary conditions, explicitly managed in float32 for TPU safety.
         """
+        # Force all tensors to explicit float32 to prevent XLA Type 15 (bfloat16) complex cast errors
+        r = psi_real.to(torch.float32)
+        i = psi_imag.to(torch.float32)
+        g = gamma.to(torch.float32)
+        L = lap_eigs.to(torch.float32)
+
+        psi = torch.complex(r, i)
         psi_hat = torch.fft.fft2(psi, dim=(-2, -1))
-        phase_arg = dt * gamma[:, :, None, None] * lap_eigs[None, None, :, :]
+        
+        phase_arg = dt * g[:, :, None, None] * L[None, None, :, :]
         phase = torch.complex(torch.cos(phase_arg), torch.sin(phase_arg))
+        
         psi_hat = psi_hat * phase
-        return torch.fft.ifft2(psi_hat, dim=(-2, -1))
+        psi_new = torch.fft.ifft2(psi_hat, dim=(-2, -1))
+        
+        # Safely split back to real and imag before returning
+        return psi_new.real, psi_new.imag
 
     def forward(self, x: torch.Tensor, k_steps: int = 4) -> torch.Tensor:
         bsz, num_tokens, d_inner = x.shape
@@ -130,19 +142,27 @@ class ExactReactionDiffusion2D(nn.Module):
         dt = 1.0 / max(int(k_steps), 1)
 
         # Work in fp32 inside the PDE block for numerical stability.
-        xr = x.to(torch.float32)
-        psi = torch.complex(
-            xr.transpose(1, 2).reshape(bsz, d_inner, h, w),
-            torch.zeros(bsz, d_inner, h, w, device=x.device, dtype=torch.float32),
-        )
+        # Suspend autocast to protect float32 from BF16 lowering in XLA
+        with torch.autocast('xla', enabled=False):
+            xr = x.to(torch.float32)
+            psi_real = xr.transpose(1, 2).reshape(bsz, d_inner, h, w)
+            psi_imag = torch.zeros_like(psi_real)
 
-        for _ in range(int(k_steps)):
-            psi = self._exact_reaction_step(psi, alpha, beta, 0.5 * dt)
-            psi = self._exact_diffusion_step(psi, gamma, lap_eigs, dt)
-            psi = self._exact_reaction_step(psi, alpha, beta, 0.5 * dt)
+            for _ in range(int(k_steps)):
+                # We do reaction on both (it acts purely on amplitude)
+                psi_complex = torch.complex(psi_real, psi_imag)
+                psi_complex = self._exact_reaction_step(psi_complex, alpha, beta, 0.5 * dt)
+                psi_real, psi_imag = psi_complex.real, psi_complex.imag
+                
+                # Diffusion strictly isolates the complex type internally
+                psi_real, psi_imag = self._exact_diffusion_step(psi_real, psi_imag, gamma, lap_eigs, dt)
+                
+                psi_complex = torch.complex(psi_real, psi_imag)
+                psi_complex = self._exact_reaction_step(psi_complex, alpha, beta, 0.5 * dt)
+                psi_real, psi_imag = psi_complex.real, psi_complex.imag
 
-        h_real = psi.real.reshape(bsz, d_inner, num_tokens).transpose(1, 2)
-        h_imag = psi.imag.reshape(bsz, d_inner, num_tokens).transpose(1, 2)
+        h_real = psi_real.reshape(bsz, d_inner, num_tokens).transpose(1, 2)
+        h_imag = psi_imag.reshape(bsz, d_inner, num_tokens).transpose(1, 2)
         combined = torch.cat([h_real, h_imag], dim=-1).to(x.dtype)
         return self.out_complex(combined) + x * self.D.to(x.dtype)
 
