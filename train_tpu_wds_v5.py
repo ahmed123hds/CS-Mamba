@@ -283,16 +283,15 @@ def _mp_fn(index, flags):
     np.random.seed(flags.seed + index)
     random.seed(flags.seed + index)
 
-    cfg = EmptyConfig(
-        img_size=flags.img_size,
-        patch_size=flags.patch_size,
-        d_embed=flags.d_embed,
-        n_mamba_layers=flags.n_mamba_layers,
-        K_steps=flags.K_steps,
-        n_classes=flags.n_classes,
-        canvas_size=flags.img_size,
-        drop_path=flags.drop_path,
-    )
+    cfg = EmptyConfig()
+    cfg.img_size = flags.img_size
+    cfg.patch_size = flags.patch_size
+    cfg.d_embed = flags.d_embed
+    cfg.n_mamba_layers = flags.n_mamba_layers
+    cfg.K_steps = flags.K_steps
+    cfg.n_classes = flags.n_classes
+    cfg.canvas_size = flags.img_size
+    cfg.drop_path = flags.drop_path
 
     model = CSMamba_V5(cfg).to(device)
 
