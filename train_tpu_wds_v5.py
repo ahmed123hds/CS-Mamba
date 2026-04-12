@@ -48,7 +48,7 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
 
-from continuous_spatial_mamba_v5 import CSMamba_V5
+from models.continuous_spatial_mamba_v5 import CSMamba_V5
 
 
 @dataclass
