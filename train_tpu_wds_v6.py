@@ -199,7 +199,7 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
         num_workers=flags.num_workers,
         pin_memory=True,
         prefetch_factor=2 if flags.num_workers > 0 else None,
-        persistent_workers=True,
+        persistent_workers=False,
     )
 
 
@@ -263,7 +263,7 @@ def build_tiny_loader(flags, is_training=True):
         num_workers=flags.num_workers,
         drop_last=is_training,
         pin_memory=True,
-        persistent_workers=True,
+        persistent_workers=False,
         collate_fn=mixup_collate if is_training else None,
     )
 
@@ -279,6 +279,9 @@ def _mp_fn(index, flags):
     torch.manual_seed(flags.seed + index)
     np.random.seed(flags.seed + index)
     random.seed(flags.seed + index)
+
+    if xm.is_master_ordinal():
+        os.makedirs(flags.save_dir, exist_ok=True)
 
     cfg = EmptyConfig()
     cfg.img_size = flags.img_size
@@ -421,7 +424,7 @@ def _mp_fn(index, flags):
             f"Train {train_time:.0f}s | Val {val_time:.0f}s | LR {scheduler.get_last_lr()[0]:.2e}\n"
         )
 
-        # ALL workers must evaluate this to prevent XLA save-barrier deadlock!
+        # Checkpointing
         ckpt = {
             "epoch": epoch,
             "state_dict": model.state_dict(),
@@ -431,12 +434,15 @@ def _mp_fn(index, flags):
             "val_acc": v_acc,
         }
         latest_path = os.path.join(flags.save_dir, f"csmamba_v6_{flags.dataset}_latest.pt")
-        xm.save(ckpt, latest_path, master_only=True, global_master=True)
+        
+        if xm.is_master_ordinal():
+            xm.save(ckpt, latest_path)
 
         if v_acc > best_acc:
             best_acc = v_acc
             best_path = os.path.join(flags.save_dir, f"csmamba_v6_{flags.dataset}_best.pt")
-            xm.save(ckpt, best_path, master_only=True, global_master=True)
+            if xm.is_master_ordinal():
+                xm.save(ckpt, best_path)
             xm.master_print(f"New best! Val Acc: {best_acc:.2f}% saved to {best_path}")
 
     xm.master_print(f"Training complete. Best Val Acc: {best_acc:.2f}%")
