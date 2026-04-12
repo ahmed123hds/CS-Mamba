@@ -406,22 +406,23 @@ def _mp_fn(index, flags):
             f"Train {train_time:.0f}s | Val {val_time:.0f}s | LR {scheduler.get_last_lr()[0]:.2e}\n"
         )
 
-        if xm.is_master_ordinal():
-            ckpt = {
-                "epoch": epoch,
-                "state_dict": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "best_acc": best_acc,
-                "val_acc": v_acc,
-            }
-            latest_path = os.path.join(flags.save_dir, f"csmamba_v5_{flags.dataset}_latest.pt")
-            xm.save(ckpt, latest_path)
-            if v_acc > best_acc:
-                best_acc = v_acc
-                best_path = os.path.join(flags.save_dir, f"csmamba_v5_{flags.dataset}_best.pt")
-                xm.save(ckpt, best_path)
-                xm.master_print(f"New best! Val Acc: {best_acc:.2f}% saved to {best_path}")
+        # ALL workers must evaluate this block to prevent XLA save-barriers from deadlocking!
+        ckpt = {
+            "epoch": epoch,
+            "state_dict": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "best_acc": best_acc,
+            "val_acc": v_acc,
+        }
+        latest_path = os.path.join(flags.save_dir, f"csmamba_v5_{flags.dataset}_latest.pt")
+        xm.save(ckpt, latest_path, master_only=True, global_master=True)
+        
+        if v_acc > best_acc:
+            best_acc = v_acc
+            best_path = os.path.join(flags.save_dir, f"csmamba_v5_{flags.dataset}_best.pt")
+            xm.save(ckpt, best_path, master_only=True, global_master=True)
+            xm.master_print(f"New best! Val Acc: {best_acc:.2f}% saved to {best_path}")
 
     xm.master_print(f"Training complete. Best Val Acc: {best_acc:.2f}%")
 
