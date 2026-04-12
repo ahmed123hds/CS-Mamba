@@ -279,6 +279,9 @@ def _mp_fn(index, flags):
     np.random.seed(flags.seed + index)
     random.seed(flags.seed + index)
 
+    if xm.is_master_ordinal():
+        os.makedirs(flags.save_dir, exist_ok=True)
+
     cfg = EmptyConfig()
     cfg.img_size = flags.img_size
     cfg.patch_size = flags.patch_size
