@@ -4,7 +4,8 @@ Characteristic Mamba V6 — Selective 2D Characteristic Transport
 Key ideas (from char_mamba_methodology.pdf):
   1. Learn a per-location transport direction via a stream function ψ
      whose curl gives a divergence-free velocity field.
-  2. Convert velocity to 4-neighbor routing weights via softmax.
+  2. Convert velocity to 5-neighbor routing weights via softmax
+     (4 neighbors + self/stay path with learned bias).
   3. Transport paired state (U, V) by weighted neighbor gathering.
   4. Optionally rotate the (U, V) pair by a learned phase angle Θ
      to retain V4's oscillatory channel coupling intuition.
@@ -60,13 +61,23 @@ class CharacteristicTransport2D(nn.Module):
 
     All operations use real-valued tensors with standard ops (F.conv2d,
     F.pad, softmax) — no FFT, no complex dtype, fully XLA/TPU safe.
+
+    Key design choices:
+      - 5-neighbor routing: 4 spatial neighbors + self/stay path.
+        At zero velocity, the self-logit dominates so patches stay in place
+        instead of destructively averaging neighbors.
+      - Configurable temperature for sharper routing decisions.
+      - Phase rotation is optional and disabled by default.
     """
 
-    def __init__(self, d_model: int, expand: int = 2, n_flow_groups: int = 4):
+    def __init__(self, d_model: int, expand: int = 2, n_flow_groups: int = 4,
+                 routing_temperature: float = 0.5, use_phase_rotation: bool = False):
         super().__init__()
         d_inner = int(expand * d_model)
         self.d_inner = d_inner
         self.n_flow_groups = n_flow_groups
+        self.routing_temperature = routing_temperature
+        self.use_phase_rotation = use_phase_rotation
         d_per_group = d_inner // n_flow_groups
 
         # --- Stream function head (predicts scalar ψ per flow group) ---
@@ -78,9 +89,14 @@ class CharacteristicTransport2D(nn.Module):
         )
 
         # --- Phase rotation head (optional, per-channel angle Θ) ---
-        self.phase_head = nn.Linear(d_inner, d_inner, bias=True)
-        nn.init.zeros_(self.phase_head.weight)
-        nn.init.zeros_(self.phase_head.bias)
+        if self.use_phase_rotation:
+            self.phase_head = nn.Linear(d_inner, d_inner, bias=True)
+            nn.init.zeros_(self.phase_head.weight)
+            nn.init.zeros_(self.phase_head.bias)
+
+        # --- Self/stay routing bias (learned per flow group) ---
+        # Initialized positive so zero velocity → strong self-retention
+        self.self_routing_bias = nn.Parameter(torch.full((1, n_flow_groups, 1, 1), 2.0))
 
         # --- Selective gates ---
         self.gate_a_head = nn.Linear(d_inner, d_inner, bias=True)  # retention
@@ -116,34 +132,37 @@ class CharacteristicTransport2D(nn.Module):
 
         return vx, vy
 
-    @staticmethod
-    def _velocity_to_routing(vx: torch.Tensor, vy: torch.Tensor,
-                              temperature: float = 1.0) -> torch.Tensor:
+    def _velocity_to_routing(self, vx: torch.Tensor, vy: torch.Tensor) -> torch.Tensor:
         """
-        Convert velocity (vx, vy) to 4-neighbor routing weights via softmax.
+        Convert velocity (vx, vy) to 5-neighbor routing weights via softmax.
 
-        Neighbors: up (-y), down (+y), left (-x), right (+x)
-        The dot product of velocity with each neighbor direction gives logits.
+        Neighbors: self, up (-y), down (+y), left (-x), right (+x)
+        The self/stay path has a learned bias so zero velocity means "stay".
 
-        Returns: routing weights (B, G, 4, H, W) summing to 1 along dim=2.
+        Returns: routing weights (B, G, 5, H, W) summing to 1 along dim=2.
         """
+        tau = self.routing_temperature
         # Neighbor direction vectors: (dy, dx)
         # up=(-1,0), down=(+1,0), left=(0,-1), right=(0,+1)
-        logits_up    = -vx / temperature   # dot with (-1, 0)
-        logits_down  =  vx / temperature   # dot with (+1, 0)
-        logits_left  = -vy / temperature   # dot with (0, -1)
-        logits_right =  vy / temperature   # dot with (0, +1)
+        logits_up    = -vx / tau   # dot with (-1, 0)
+        logits_down  =  vx / tau   # dot with (+1, 0)
+        logits_left  = -vy / tau   # dot with (0, -1)
+        logits_right =  vy / tau   # dot with (0, +1)
 
-        # Stack and softmax: (B, G, 4, H, W)
-        logits = torch.stack([logits_up, logits_down, logits_left, logits_right], dim=2)
+        # Self/stay logit: learned bias, expanded to match spatial dims
+        logits_self = self.self_routing_bias.expand_as(vx)  # (B, G, H, W)
+
+        # Stack and softmax: (B, G, 5, H, W) — self is index 0
+        logits = torch.stack([logits_self, logits_up, logits_down, logits_left, logits_right], dim=2)
         return F.softmax(logits, dim=2)
 
     def _transport(self, state: torch.Tensor, routing: torch.Tensor) -> torch.Tensor:
         """
-        Transport state using 4-neighbor weighted gather.
+        Transport state using 5-neighbor weighted gather (4 spatial + self).
 
         state: (B, D, H, W)
-        routing: (B, G, 4, H, W) — G groups, each controlling D//G channels
+        routing: (B, G, 5, H, W) — G groups, each controlling D//G channels
+                 index 0 = self, 1 = up, 2 = down, 3 = left, 4 = right
 
         Returns: transported state (B, D, H, W)
         """
@@ -152,22 +171,21 @@ class CharacteristicTransport2D(nn.Module):
         C = D // G  # channels per group
 
         # Gather neighbors via constant padding
-        # Circular padding translates into hundreds of slice+concat ops in XLA compiler.
         s_up    = F.pad(state, [0, 0, 1, 1], mode="constant", value=0.0)[:, :, :-2, :]
         s_down  = F.pad(state, [0, 0, 1, 1], mode="constant", value=0.0)[:, :, 2:,  :]
         s_left  = F.pad(state, [1, 1, 0, 0], mode="constant", value=0.0)[:, :, :, :-2]
         s_right = F.pad(state, [1, 1, 0, 0], mode="constant", value=0.0)[:, :, :, 2:]
 
-        # Stack neighbors: (B, D, 4, H, W)
-        neighbors = torch.stack([s_up, s_down, s_left, s_right], dim=2)
-        
-        # Reshape for broadcasting instead of repeat_interleave
-        # neighbors: (B, G, C, 4, H, W)
-        neighbors = neighbors.view(B, G, C, 4, H, W)
-        # routing: (B, G, 1, 4, H, W)
+        # Stack: self + 4 neighbors → (B, D, 5, H, W)
+        neighbors = torch.stack([state, s_up, s_down, s_left, s_right], dim=2)
+
+        # Reshape for broadcasting
+        # neighbors: (B, G, C, 5, H, W)
+        neighbors = neighbors.view(B, G, C, 5, H, W)
+        # routing: (B, G, 1, 5, H, W)
         routing_bcast = routing.unsqueeze(2)
-        
-        # Weighted sum: (B, G, C, H, W) -> (B, D, H, W)
+
+        # Weighted sum: (B, G, C, H, W) → (B, D, H, W)
         transported = (neighbors * routing_bcast).sum(dim=3).view(B, D, H, W)
         return transported
 
@@ -199,14 +217,18 @@ class CharacteristicTransport2D(nn.Module):
         # Velocity from curl of stream function
         vx, vy = self._stream_to_velocity(psi)
 
-        # Routing weights (4-neighbor softmax)
-        routing = self._velocity_to_routing(vx, vy)                 # (B, G, 4, H, W)
+        # Routing weights (5-neighbor softmax: self + 4 spatial)
+        routing = self._velocity_to_routing(vx, vy)                 # (B, G, 5, H, W)
 
-        # Phase angle
-        theta = self.phase_head(x)                                  # (B, N, D)
-        theta = theta.permute(0, 2, 1).unflatten(2, (h, w))        # (B, D, H, W)
-        cos_t = torch.cos(theta)
-        sin_t = torch.sin(theta)
+        # Phase angle (only if enabled)
+        if self.use_phase_rotation:
+            theta = self.phase_head(x)                              # (B, N, D)
+            theta = theta.permute(0, 2, 1).unflatten(2, (h, w))    # (B, D, H, W)
+            cos_t = torch.cos(theta)
+            sin_t = torch.sin(theta)
+        else:
+            cos_t = None
+            sin_t = None
 
         # Selective gates
         gate_a = torch.sigmoid(self.gate_a_head(x))                 # (B, N, D)
@@ -228,8 +250,12 @@ class CharacteristicTransport2D(nn.Module):
             v_hat = self._transport(v, routing)
 
             # 2. Phase rotation (optional oscillatory channel coupling)
-            u_rot = cos_t * u_hat - sin_t * v_hat
-            v_rot = sin_t * u_hat + cos_t * v_hat
+            if self.use_phase_rotation:
+                u_rot = cos_t * u_hat - sin_t * v_hat
+                v_rot = sin_t * u_hat + cos_t * v_hat
+            else:
+                u_rot = u_hat
+                v_rot = v_hat
 
             # 3. Selective recurrence: retain + inject
             u = gate_a * u_rot + gate_b * xu
@@ -251,7 +277,8 @@ class CharacteristicMambaBlock_V6(nn.Module):
     """Drop-in block wrapping the characteristic transport operator."""
 
     def __init__(self, d_model: int, expand: int = 2, drop_path: float = 0.0,
-                 n_flow_groups: int = 4):
+                 n_flow_groups: int = 4, routing_temperature: float = 0.5,
+                 use_phase_rotation: bool = False):
         super().__init__()
         d_inner = int(expand * d_model)
         self.norm = nn.LayerNorm(d_model)
@@ -262,6 +289,8 @@ class CharacteristicMambaBlock_V6(nn.Module):
         self.activation = nn.SiLU()
         self.ssm = CharacteristicTransport2D(
             d_model=d_model, expand=expand, n_flow_groups=n_flow_groups,
+            routing_temperature=routing_temperature,
+            use_phase_rotation=use_phase_rotation,
         )
         self.out_proj = nn.Linear(d_inner, d_model, bias=False)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -305,9 +334,11 @@ class CSMamba_V6(nn.Module):
         d_embed = getattr(cfg, "d_embed", 384)
         n_layers = getattr(cfg, "n_mamba_layers", 12)
         n_classes = getattr(cfg, "n_classes", 1000)
-        k_steps = getattr(cfg, "K_steps", 4)
+        k_steps = getattr(cfg, "K_steps", 2)
         drop_path_rate = getattr(cfg, "drop_path", 0.1)
         n_flow_groups = getattr(cfg, "n_flow_groups", 4)
+        routing_temp = getattr(cfg, "routing_temperature", 0.5)
+        use_phase = getattr(cfg, "use_phase_rotation", False)
 
         self.k_steps = k_steps
         num_patches = (img_size // patch_size) ** 2
@@ -320,6 +351,7 @@ class CSMamba_V6(nn.Module):
         self.layers = nn.ModuleList([
             CharacteristicMambaBlock_V6(
                 d_model=d_embed, drop_path=dp_rates[i], n_flow_groups=n_flow_groups,
+                routing_temperature=routing_temp, use_phase_rotation=use_phase,
             )
             for i in range(n_layers)
         ])
