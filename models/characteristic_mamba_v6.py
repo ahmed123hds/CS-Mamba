@@ -104,17 +104,14 @@ class CharacteristicTransport2D(nn.Module):
     def _stream_to_velocity(psi: torch.Tensor) -> tuple:
         """
         Compute velocity from stream function via discrete curl:
-          vx =  ∂ψ/∂y  (finite difference along H dimension)
-          vy = -∂ψ/∂x  (finite difference along W dimension)
-
-        psi: (B, G, H, W) where G = n_flow_groups
-        Returns: vx, vy each (B, G, H, W)
+          vx =  ∂ψ/∂y
+          vy = -∂ψ/∂x
         """
-        # Central differences with circular padding
-        psi_pad_h = F.pad(psi, [0, 0, 1, 1], mode="circular")  # pad H
+        # Use constant (zero) padding instead of circular to prevent XLA compile hang
+        psi_pad_h = F.pad(psi, [0, 0, 1, 1], mode="constant", value=0.0)
         vx = 0.5 * (psi_pad_h[:, :, 2:, :] - psi_pad_h[:, :, :-2, :])
 
-        psi_pad_w = F.pad(psi, [1, 1, 0, 0], mode="circular")  # pad W
+        psi_pad_w = F.pad(psi, [1, 1, 0, 0], mode="constant", value=0.0)
         vy = -0.5 * (psi_pad_w[:, :, :, 2:] - psi_pad_w[:, :, :, :-2])
 
         return vx, vy
@@ -154,20 +151,24 @@ class CharacteristicTransport2D(nn.Module):
         G = self.n_flow_groups
         C = D // G  # channels per group
 
-        # Gather neighbors via circular-padded shifts
-        s_up    = F.pad(state, [0, 0, 1, 1], mode="circular")[:, :, :-2, :]  # shift up
-        s_down  = F.pad(state, [0, 0, 1, 1], mode="circular")[:, :, 2:,  :]  # shift down
-        s_left  = F.pad(state, [1, 1, 0, 0], mode="circular")[:, :, :, :-2]  # shift left
-        s_right = F.pad(state, [1, 1, 0, 0], mode="circular")[:, :, :, 2:]   # shift right
+        # Gather neighbors via constant padding
+        # Circular padding translates into hundreds of slice+concat ops in XLA compiler.
+        s_up    = F.pad(state, [0, 0, 1, 1], mode="constant", value=0.0)[:, :, :-2, :]
+        s_down  = F.pad(state, [0, 0, 1, 1], mode="constant", value=0.0)[:, :, 2:,  :]
+        s_left  = F.pad(state, [1, 1, 0, 0], mode="constant", value=0.0)[:, :, :, :-2]
+        s_right = F.pad(state, [1, 1, 0, 0], mode="constant", value=0.0)[:, :, :, 2:]
 
         # Stack neighbors: (B, D, 4, H, W)
         neighbors = torch.stack([s_up, s_down, s_left, s_right], dim=2)
-
-        # Expand routing from (B, G, 4, H, W) to (B, D, 4, H, W) by repeating per group
-        routing_expanded = routing.repeat_interleave(C, dim=1)  # (B, D, 4, H, W)
-
-        # Weighted sum over neighbors
-        transported = (neighbors * routing_expanded).sum(dim=2)  # (B, D, H, W)
+        
+        # Reshape for broadcasting instead of repeat_interleave
+        # neighbors: (B, G, C, 4, H, W)
+        neighbors = neighbors.view(B, G, C, 4, H, W)
+        # routing: (B, G, 1, 4, H, W)
+        routing_bcast = routing.unsqueeze(2)
+        
+        # Weighted sum: (B, G, C, H, W) -> (B, D, H, W)
+        transported = (neighbors * routing_bcast).sum(dim=3).view(B, D, H, W)
         return transported
 
     def forward(self, x: torch.Tensor, k_steps: int = 4) -> torch.Tensor:
