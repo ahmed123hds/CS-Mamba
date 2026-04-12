@@ -1,12 +1,14 @@
 """
-CS-Mamba V5 training script for TPU.
+CS-Mamba V5 — TPU Training Script
+=================================
+Real-valued symplectic reaction-diffusion backbone.
+No torch.fft, no torch.complex, TPU/XLA-friendly BF16 path.
 
-Main fixes over V4:
-  - uses the V5 exact split-step model
-  - optional TPU bfloat16 autocast
-  - more honest train accuracy under mixup/cutmix
-  - safer loader defaults for XLA
-  - local import path, so the file can run directly beside the model file
+Recommended usage:
+  python train_tpu_wds_v5.py --dataset tiny-imagenet --amp_bf16
+
+If you want global XLA BF16 remapping, set it outside the script before launch:
+  export XLA_USE_BF16=1
 """
 
 import os
@@ -21,11 +23,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-# Let external env vars win, but default to TPU-friendly settings.
 os.environ.setdefault("PJRT_DEVICE", "TPU")
-os.environ.setdefault("XLA_USE_BF16", "1")
 
-# Suppress the noisy XLA dataloader KeyError at shutdown.
 _orig_excepthook = threading.excepthook
 
 
@@ -48,7 +47,7 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
 
-from models.continuous_spatial_mamba_v5 import CSMamba_V5
+from continuous_spatial_mamba_v5 import CSMamba_V5
 
 
 @dataclass
@@ -108,7 +107,6 @@ def mixup_data(images, labels, alpha=0.8):
     return mixed, labels, labels[index], float(lam)
 
 
-
 def cutmix_data(images, labels, alpha=1.0):
     lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
     bsz, _, h, w = images.shape
@@ -124,10 +122,8 @@ def cutmix_data(images, labels, alpha=1.0):
     return mixed, labels, labels[index], float(lam)
 
 
-
 def mixup_criterion(criterion, logits, labels_a, labels_b, lam):
     return lam * criterion(logits, labels_a) + (1.0 - lam) * criterion(logits, labels_b)
-
 
 
 def mixed_top1(logits, labels_a, labels_b, lam):
@@ -135,7 +131,6 @@ def mixed_top1(logits, labels_a, labels_b, lam):
     correct_a = pred.eq(labels_a).float()
     correct_b = pred.eq(labels_b).float()
     return (lam * correct_a + (1.0 - lam) * correct_b).sum().item()
-
 
 
 def build_lr_scheduler(optimizer, flags, scaled_lr):
@@ -151,7 +146,6 @@ def build_lr_scheduler(optimizer, flags, scaled_lr):
         return max(min_lr / scaled_lr, cosine_factor)
 
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
 
 
 def build_wds_loader(shards_url, batch_size, flags, is_training=True):
@@ -197,7 +191,6 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
         .map(apply_transforms)
         .batched(batch_size, partial=False)
     )
-
     dataset = dataset.map(apply_mix if is_training else apply_stack_val)
     return wds.WebLoader(
         dataset,
@@ -223,7 +216,6 @@ class TinyImageNetDataset(torch.utils.data.Dataset):
         if image.mode != "RGB":
             image = image.convert("RGB")
         return self.transform(image) if self.transform else image, label
-
 
 
 def build_tiny_loader(flags, is_training=True):
@@ -263,18 +255,20 @@ def build_tiny_loader(flags, is_training=True):
         rank=xm.get_ordinal(),
         shuffle=is_training,
     )
-
     return DataLoader(
         dataset,
         batch_size=flags.batch_size,
         sampler=sampler,
         num_workers=flags.num_workers,
         drop_last=is_training,
-        pin_memory=True,
-        persistent_workers=False,
         collate_fn=mixup_collate if is_training else None,
     )
 
+
+def _maybe_autocast(flags):
+    if flags.amp_bf16:
+        return torch.autocast(device_type="xla", dtype=torch.bfloat16)
+    return torch.autocast(device_type="xla", enabled=False)
 
 
 def _mp_fn(index, flags):
@@ -300,14 +294,18 @@ def _mp_fn(index, flags):
     scaled_lr = flags.base_lr * (global_bs / 1024.0)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=flags.label_smooth)
-    optimizer = optim.AdamW(model.parameters(), lr=scaled_lr, weight_decay=flags.weight_decay, betas=(0.9, 0.999))
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=scaled_lr,
+        weight_decay=flags.weight_decay,
+        betas=(0.9, 0.999),
+    )
     scheduler = build_lr_scheduler(optimizer, flags, scaled_lr)
 
     start_epoch = 1
     best_acc = 0.0
-
     if flags.resume:
-        xm.master_print(f"Resuming from: {flags.resume}", flush=True)
+        xm.master_print(f"Resuming from: {flags.resume}")
         ckpt = torch.load(flags.resume, map_location="cpu")
         if "state_dict" in ckpt:
             model.load_state_dict(ckpt["state_dict"])
@@ -333,64 +331,58 @@ def _mp_fn(index, flags):
         val_steps = math.ceil(10_000 / global_bs)
 
     n_params = sum(p.numel() for p in model.parameters())
-    xm.master_print(
-        f"\n{'=' * 72}\n"
-        f"CS-Mamba V5 | dataset={flags.dataset} | params={n_params / 1e6:.2f}M\n"
-        f"cores={world_size} | global_bs={global_bs} | lr={scaled_lr:.6f} | amp_bf16={flags.amp_bf16}\n"
-        f"{'=' * 72}\n",
-        flush=True,
-    )
+    xm.master_print(f"\n{'='*72}")
+    xm.master_print(f"CS-Mamba V5 (Real Symplectic) | Params: {n_params/1e6:.1f}M")
+    xm.master_print(f"World Size: {world_size} TPU cores | Global BS: {global_bs}")
+    xm.master_print(f"Scaled LR: {scaled_lr:.6f} | AMP BF16: {flags.amp_bf16}")
+    xm.master_print(f"{'='*72}\n")
 
-    autocast_ctx = torch.autocast("xla", dtype=torch.bfloat16, enabled=flags.amp_bf16)
+    autocast_ctx = _maybe_autocast(flags)
 
     for epoch in range(start_epoch, flags.epochs + 1):
         if not is_imagenet:
             train_loader.sampler.set_epoch(epoch)
 
-        # Train
         pl_train = pl.ParallelLoader(train_loader, [device])
         para_train = pl_train.per_device_loader(device)
 
         model.train()
         tracker = xm.RateTracker()
-        total_loss, weighted_correct, total = 0.0, 0.0, 0
+        total_loss, total_correct, total = 0.0, 0.0, 0
         t0 = time.time()
 
         for step, batch in enumerate(para_train):
             if step >= train_steps:
                 break
-
             images, labels_a, labels_b, lam = batch
             optimizer.zero_grad(set_to_none=True)
             with autocast_ctx:
                 logits = model(images)
                 loss = mixup_criterion(criterion, logits, labels_a, labels_b, lam)
             loss.backward()
-
             xm.reduce_gradients(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), flags.grad_clip)
             xm.optimizer_step(optimizer)
             tracker.add(flags.batch_size)
 
             total_loss += loss.item() * images.size(0)
-            weighted_correct += mixed_top1(logits, labels_a, labels_b, lam)
+            total_correct += mixed_top1(logits, labels_a, labels_b, float(lam))
             total += images.size(0)
 
             if step > 0 and step % (50 if is_imagenet else 10) == 0:
                 xm.master_print(
-                    f"E{epoch:03d} | step {step}/{train_steps} | loss {loss.item():.4f} | rate {tracker.global_rate():.1f} img/s",
-                    flush=True,
+                    f"E{epoch:03d} | Step {step}/{train_steps} | "
+                    f"Loss {loss.item():.4f} | Rate {tracker.global_rate():.1f} img/s"
                 )
 
         train_time = time.time() - t0
-        train_n = max(xm.mesh_reduce("tr_n", total, np.sum), 1)
-        g_loss = xm.mesh_reduce("tr_loss", total_loss, np.sum) / train_n
-        g_acc = 100.0 * xm.mesh_reduce("tr_c", weighted_correct, np.sum) / train_n
+        g_total = max(xm.mesh_reduce("tr_n", total, np.sum), 1)
+        g_loss = xm.mesh_reduce("tr_loss", total_loss, np.sum) / g_total
+        g_acc = 100.0 * xm.mesh_reduce("tr_c", total_correct, np.sum) / g_total
 
         del para_train, pl_train
         gc.collect()
 
-        # Validate
         pl_val = pl.ParallelLoader(val_loader, [device])
         para_val = pl_val.per_device_loader(device)
 
@@ -409,17 +401,16 @@ def _mp_fn(index, flags):
             xm.mark_step()
 
         val_time = time.time() - t1
-        v_total_global = max(xm.mesh_reduce("v_n", v_total, np.sum), 1)
-        v_acc = 100.0 * xm.mesh_reduce("v_c", v_correct, np.sum) / v_total_global
+        v_acc = 100.0 * xm.mesh_reduce("v_c", v_correct, np.sum) / max(xm.mesh_reduce("v_n", v_total, np.sum), 1)
         scheduler.step()
 
         del para_val, pl_val
         gc.collect()
 
         xm.master_print(
-            f"\nEpoch {epoch:03d}/{flags.epochs} | train {g_acc:.2f}% | val {v_acc:.2f}% | "
-            f"train_loss {g_loss:.4f} | train_t {train_time:.0f}s | val_t {val_time:.0f}s | lr {scheduler.get_last_lr()[0]:.2e}\n",
-            flush=True,
+            f"\nEpoch {epoch:03d}/{flags.epochs} | "
+            f"Train {g_acc:.1f}% (loss {g_loss:.4f}) | Val {v_acc:.1f}% | "
+            f"Train {train_time:.0f}s | Val {val_time:.0f}s | LR {scheduler.get_last_lr()[0]:.2e}\n"
         )
 
         if xm.is_master_ordinal():
@@ -430,28 +421,22 @@ def _mp_fn(index, flags):
                 "scheduler": scheduler.state_dict(),
                 "best_acc": best_acc,
                 "val_acc": v_acc,
-                "args": vars(flags),
             }
             latest_path = os.path.join(flags.save_dir, f"csmamba_v5_{flags.dataset}_latest.pt")
             xm.save(ckpt, latest_path)
-
-            if epoch % flags.save_every == 0:
-                epoch_path = os.path.join(flags.save_dir, f"csmamba_v5_{flags.dataset}_epoch{epoch:03d}.pt")
-                xm.save(ckpt, epoch_path)
-
             if v_acc > best_acc:
                 best_acc = v_acc
                 best_path = os.path.join(flags.save_dir, f"csmamba_v5_{flags.dataset}_best.pt")
                 xm.save(ckpt, best_path)
-                xm.master_print(f"New best saved: {best_acc:.2f}% -> {best_path}", flush=True)
+                xm.master_print(f"New best! Val Acc: {best_acc:.2f}% saved to {best_path}")
 
-    xm.master_print(f"Training complete. Best val acc: {best_acc:.2f}%", flush=True)
+    xm.master_print(f"Training complete. Best Val Acc: {best_acc:.2f}%")
 
 
 if __name__ == "__main__":
     flags = parse_args()
     if flags.dataset == "tiny-imagenet":
         from datasets import load_dataset
-        print("[main] prefetching Tiny-ImageNet cache...")
+        print("[Main] Pre-fetching Tiny-ImageNet cache...")
         load_dataset("Maysee/tiny-imagenet")
     xmp.spawn(_mp_fn, args=(flags,), nprocs=None, start_method="fork")

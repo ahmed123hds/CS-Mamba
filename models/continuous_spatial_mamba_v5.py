@@ -1,6 +1,6 @@
 import math
 import logging
-from typing import Dict, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -21,24 +21,30 @@ class DropPath(nn.Module):
             return x
         keep_prob = 1.0 - self.drop_prob
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        random_tensor = torch.floor(
-            torch.rand(shape, dtype=x.dtype, device=x.device) + keep_prob
-        )
+        random_tensor = torch.floor(torch.rand(shape, dtype=x.dtype, device=x.device) + keep_prob)
         return x * random_tensor / keep_prob
 
 
-class ExactReactionDiffusion2D(nn.Module):
+class RealSymplecticReactionDiffusion2D(nn.Module):
     """
-    Structure-preserving 2D Schrödinger + Ginzburg-Landau block.
+    TPU-native real-valued Schrödinger-inspired block.
 
-    Key design changes relative to V4:
-      1) The diffusion step is *exactly* integrated in the spectral domain.
-      2) The spatial operator is a fixed periodic 2D Laplacian, so it is self-adjoint.
-      3) The reaction step is integrated in closed form on |psi|^2.
-      4) We use Strang splitting: half reaction -> full diffusion -> half reaction.
+    State representation:
+        psi = u + i v  is represented by two real tensors (u, v).
 
-    This makes the discrete diffusion step genuinely norm-preserving instead of
-    merely inspired by unitary continuous-time dynamics.
+    Linear Hamiltonian flow:
+        u_t =  gamma * Lap(v)
+        v_t = -gamma * Lap(u)
+
+    Nonlinear reaction flow:
+        psi_t = psi * (alpha - beta |psi|^2)
+
+    Discretization:
+        Strang splitting with an exact scalar reaction step and a leapfrog
+        (Störmer-Verlet style) symplectic update for the linear Hamiltonian step.
+
+    This avoids backend-fragile complex FFT dependencies, so it is compatible with
+    BF16 TPU execution and PyTorch XLA lowering.
     """
 
     def __init__(self, d_model: int, expand: int = 2):
@@ -46,84 +52,89 @@ class ExactReactionDiffusion2D(nn.Module):
         d_inner = int(expand * d_model)
         self.d_inner = d_inner
 
-        # Sample-adaptive but spatially uniform diffusion coefficient per channel.
-        # This keeps the discrete spatial operator self-adjoint for every sample.
+        # Sample-adaptive but spatially uniform diffusion strength per channel.
         self.diffusion_gate = nn.Linear(d_inner, d_inner, bias=True)
         nn.init.uniform_(self.diffusion_gate.weight, -1e-4, 1e-4)
         nn.init.constant_(self.diffusion_gate.bias, math.log(math.exp(0.08) - 1.0))
         self.log_diffusion_base = nn.Parameter(torch.full((1, d_inner), -2.5))
-        self.max_diffusion = 0.35
+        self.max_diffusion = 0.25
 
-        # Bounded reaction parameters for stable amplitude dynamics.
+        # Reaction parameters. Alpha is bounded; beta stays positive.
         self.reaction_alpha_raw = nn.Parameter(torch.zeros(1, 1, d_inner))
         self.reaction_beta_raw = nn.Parameter(torch.full((1, 1, d_inner), -2.0))
-        self.alpha_scale = 0.25
+        self.alpha_scale = 0.20
         self.beta_eps = 1e-4
 
-        # Complex output mixer + skip scale.
+        # Final real-valued complex mixer + residual diagonal.
         self.out_complex = nn.Linear(d_inner * 2, d_inner, bias=False)
         self.D = nn.Parameter(torch.ones(d_inner))
 
-        self._laplacian_cache: Dict[Tuple[int, int, str], torch.Tensor] = {}
+    @staticmethod
+    def _laplacian_periodic(x: torch.Tensor) -> torch.Tensor:
+        """Periodic 5-point Laplacian using only TPU-native real ops."""
+        return (
+            torch.roll(x, shifts=1, dims=-2)
+            + torch.roll(x, shifts=-1, dims=-2)
+            + torch.roll(x, shifts=1, dims=-1)
+            + torch.roll(x, shifts=-1, dims=-1)
+            - 4.0 * x
+        )
 
-    def _laplacian_eigs(self, h: int, w: int, device: torch.device) -> torch.Tensor:
-        key = (h, w, str(device))
-        cached = self._laplacian_cache.get(key)
-        if cached is not None:
-            return cached
+    def _reaction_params(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        pooled = x.mean(dim=1)
+        gamma = F.softplus(self.diffusion_gate(pooled) + self.log_diffusion_base)
+        gamma = gamma.clamp(max=self.max_diffusion).unsqueeze(-1).unsqueeze(-1)  # (B, D, 1, 1)
 
-        ky = torch.arange(h, device=device, dtype=torch.float32)
-        kx = torch.arange(w, device=device, dtype=torch.float32)
-        eig_y = 2.0 * torch.cos(2.0 * math.pi * ky / h) - 2.0
-        eig_x = 2.0 * torch.cos(2.0 * math.pi * kx / w) - 2.0
-        eig = eig_y[:, None] + eig_x[None, :]  # values in [-8, 0]
-        self._laplacian_cache[key] = eig
-        return eig
+        alpha = self.alpha_scale * torch.tanh(self.reaction_alpha_raw)
+        beta = F.softplus(self.reaction_beta_raw) + self.beta_eps
+        alpha = alpha.permute(0, 2, 1).unsqueeze(-1)  # (1, D, 1, 1)
+        beta = beta.permute(0, 2, 1).unsqueeze(-1)    # (1, D, 1, 1)
+        return gamma, alpha, beta
 
-    def _exact_reaction_step(self, psi: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor, dt: float) -> torch.Tensor:
+    @staticmethod
+    def _exact_reaction_step(
+        u: torch.Tensor,
+        v: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        dt: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Exact update for q = |psi|^2 under
+        Exact amplitude update for q = u^2 + v^2 under
             dq/dt = 2 alpha q - 2 beta q^2.
-        Phase stays unchanged; only amplitude changes.
+        The phase is unchanged, so both u and v are scaled by the same factor.
         """
         eps = 1e-8
-        q = psi.real.square() + psi.imag.square()
+        q = u.square() + v.square()
         a = 2.0 * alpha
         b = 2.0 * beta
 
-        small_mask = a.abs() < 1e-6
         exp_term = torch.exp(-a * dt)
         denom = b * q + (a - b * q) * exp_term
         q_general = (a * q) / denom.clamp_min(eps)
         q_zero_alpha = q / (1.0 + b * q * dt)
-        q_new = torch.where(small_mask, q_zero_alpha, q_general).clamp_min(0.0)
+        q_new = torch.where(a.abs() < 1e-6, q_zero_alpha, q_general).clamp_min(0.0)
 
         scale = torch.sqrt(q_new / q.clamp_min(eps))
-        return psi * scale.to(psi.dtype)
+        return u * scale, v * scale
 
-    def _exact_diffusion_step(self, psi_real: torch.Tensor, psi_imag: torch.Tensor, gamma: torch.Tensor, lap_eigs: torch.Tensor, dt: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _leapfrog_hamiltonian_step(
+        self,
+        u: torch.Tensor,
+        v: torch.Tensor,
+        gamma: torch.Tensor,
+        dt: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Exact discrete Schrödinger flow for
-            d psi / dt = i * gamma * Laplacian(psi)
-        with periodic boundary conditions, explicitly managed in float32 for TPU safety.
+        Real-valued symplectic update for
+            u_t =  gamma * Lap(v)
+            v_t = -gamma * Lap(u)
+        using a leapfrog/Störmer-Verlet style step.
         """
-        # Force all tensors to explicit float32 to prevent XLA Type 15 (bfloat16) complex cast errors
-        r = psi_real.to(torch.float32)
-        i = psi_imag.to(torch.float32)
-        g = gamma.to(torch.float32)
-        L = lap_eigs.to(torch.float32)
-
-        psi = torch.complex(r, i)
-        psi_hat = torch.fft.fft2(psi, dim=(-2, -1))
-        
-        phase_arg = dt * g[:, :, None, None] * L[None, None, :, :]
-        phase = torch.complex(torch.cos(phase_arg), torch.sin(phase_arg))
-        
-        psi_hat = psi_hat * phase
-        psi_new = torch.fft.ifft2(psi_hat, dim=(-2, -1))
-        
-        # Safely split back to real and imag before returning
-        return psi_new.real, psi_new.imag
+        v_half = v - 0.5 * dt * gamma * self._laplacian_periodic(u)
+        u_new = u + dt * gamma * self._laplacian_periodic(v_half)
+        v_new = v_half - 0.5 * dt * gamma * self._laplacian_periodic(u_new)
+        return u_new, v_new
 
     def forward(self, x: torch.Tensor, k_steps: int = 4) -> torch.Tensor:
         bsz, num_tokens, d_inner = x.shape
@@ -131,53 +142,38 @@ class ExactReactionDiffusion2D(nn.Module):
         if h * w != num_tokens:
             raise ValueError(f"Expected square token grid, got N={num_tokens}")
 
-        # Sample-adaptive but spatially uniform diffusion coefficient.
-        pooled = x.mean(dim=1)
-        gamma = F.softplus(self.diffusion_gate(pooled) + self.log_diffusion_base)
-        gamma = gamma.clamp(max=self.max_diffusion).to(torch.float32)
-
-        alpha = (self.alpha_scale * torch.tanh(self.reaction_alpha_raw)).permute(0, 2, 1).unsqueeze(-1)
-        beta = (F.softplus(self.reaction_beta_raw) + self.beta_eps).permute(0, 2, 1).unsqueeze(-1)
-        lap_eigs = self._laplacian_eigs(h, w, x.device)
+        gamma, alpha, beta = self._reaction_params(x)
         dt = 1.0 / max(int(k_steps), 1)
 
-        # Work in fp32 inside the PDE block for numerical stability.
-        # Suspend autocast to protect float32 from BF16 lowering in XLA
-        with torch.autocast('xla', enabled=False):
-            xr = x.to(torch.float32)
-            psi_real = xr.transpose(1, 2).reshape(bsz, d_inner, h, w)
-            psi_imag = torch.zeros_like(psi_real)
+        # Keep dtype native to the incoming activation so BF16 on TPU stays fast.
+        state_dtype = x.dtype
+        u = x.transpose(1, 2).reshape(bsz, d_inner, h, w).to(state_dtype)
+        v = torch.zeros_like(u)
 
-            for _ in range(int(k_steps)):
-                # We do reaction on both (it acts purely on amplitude)
-                psi_complex = torch.complex(psi_real, psi_imag)
-                psi_complex = self._exact_reaction_step(psi_complex, alpha, beta, 0.5 * dt)
-                psi_real, psi_imag = psi_complex.real, psi_complex.imag
-                
-                # Diffusion strictly isolates the complex type internally
-                psi_real, psi_imag = self._exact_diffusion_step(psi_real, psi_imag, gamma, lap_eigs, dt)
-                
-                psi_complex = torch.complex(psi_real, psi_imag)
-                psi_complex = self._exact_reaction_step(psi_complex, alpha, beta, 0.5 * dt)
-                psi_real, psi_imag = psi_complex.real, psi_complex.imag
+        gamma = gamma.to(state_dtype)
+        alpha = alpha.to(state_dtype)
+        beta = beta.to(state_dtype)
 
-        h_real = psi_real.reshape(bsz, d_inner, num_tokens).transpose(1, 2)
-        h_imag = psi_imag.reshape(bsz, d_inner, num_tokens).transpose(1, 2)
-        combined = torch.cat([h_real, h_imag], dim=-1).to(x.dtype)
+        half_dt = 0.5 * dt
+        for _ in range(int(k_steps)):
+            u, v = self._exact_reaction_step(u, v, alpha, beta, half_dt)
+            u, v = self._leapfrog_hamiltonian_step(u, v, gamma, dt)
+            u, v = self._exact_reaction_step(u, v, alpha, beta, half_dt)
+
+        u = u.reshape(bsz, d_inner, num_tokens).transpose(1, 2)
+        v = v.reshape(bsz, d_inner, num_tokens).transpose(1, 2)
+        combined = torch.cat([u, v], dim=-1)
         return self.out_complex(combined) + x * self.D.to(x.dtype)
 
 
 class ContinuousSpatialMambaBlock_V5(nn.Module):
-    """
-    Exact reaction-diffusion block dropped into the same outer scaffold.
-    """
+    """Drop-in block using the real-valued symplectic spatial operator."""
 
     def __init__(self, d_model: int, expand: int = 2, drop_path: float = 0.0):
         super().__init__()
         d_inner = int(expand * d_model)
         self.norm = nn.LayerNorm(d_model)
         self.in_proj = nn.Linear(d_model, d_inner * 2, bias=False)
-
         self.local_conv2d = nn.Conv2d(
             d_inner,
             d_inner,
@@ -187,7 +183,7 @@ class ContinuousSpatialMambaBlock_V5(nn.Module):
             bias=True,
         )
         self.activation = nn.SiLU()
-        self.ssm = ExactReactionDiffusion2D(d_model=d_model, expand=expand)
+        self.ssm = RealSymplecticReactionDiffusion2D(d_model=d_model, expand=expand)
         self.out_proj = nn.Linear(d_inner, d_model, bias=False)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
@@ -215,7 +211,7 @@ class CSMamba_V5(nn.Module):
     """
     CS-Mamba V5
     ------------
-    The diffusion step is now exactly norm-preserving in the discrete model.
+    Purely real-valued, TPU-native, symplectic reaction-diffusion backbone.
     """
 
     def __init__(self, cfg):
@@ -246,7 +242,7 @@ class CSMamba_V5(nn.Module):
 
         n_params = sum(p.numel() for p in self.parameters())
         logger.info(
-            "CSMamba_V5 (Exact Schrödinger Split-Step) %.1fM params, d=%d, layers=%d, K=%d",
+            "CSMamba_V5 (Real Symplectic) %.1fM params, d=%d, layers=%d, K=%d",
             n_params / 1e6,
             d_embed,
             n_layers,
@@ -258,3 +254,10 @@ class CSMamba_V5(nn.Module):
         for layer in self.layers:
             x = layer(x, k_steps=self.k_steps)
         return self.head(self.final_norm(x).mean(dim=1))
+
+
+__all__ = [
+    "RealSymplecticReactionDiffusion2D",
+    "ContinuousSpatialMambaBlock_V5",
+    "CSMamba_V5",
+]
