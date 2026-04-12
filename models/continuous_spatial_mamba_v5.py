@@ -57,7 +57,7 @@ class RealSymplecticReactionDiffusion2D(nn.Module):
         nn.init.uniform_(self.diffusion_gate.weight, -1e-4, 1e-4)
         nn.init.constant_(self.diffusion_gate.bias, math.log(math.exp(0.08) - 1.0))
         self.log_diffusion_base = nn.Parameter(torch.full((1, d_inner), -2.5))
-        self.max_diffusion = 0.25
+        self.max_diffusion = 0.08
 
         # Reaction parameters. Alpha is bounded; beta stays positive.
         self.reaction_alpha_raw = nn.Parameter(torch.zeros(1, 1, d_inner))
@@ -100,23 +100,32 @@ class RealSymplecticReactionDiffusion2D(nn.Module):
         dt: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Exact amplitude update for q = u^2 + v^2 under
+        Numerically stabilized amplitude update for q = u^2 + v^2 under
             dq/dt = 2 alpha q - 2 beta q^2.
-        The phase is unchanged, so both u and v are scaled by the same factor.
         """
-        eps = 1e-8
-        q = u.square() + v.square()
-        a = 2.0 * alpha
-        b = 2.0 * beta
+        eps = 1e-6
 
-        exp_term = torch.exp(-a * dt)
-        denom = b * q + (a - b * q) * exp_term
-        q_general = (a * q) / denom.clamp_min(eps)
-        q_zero_alpha = q / (1.0 + b * q * dt)
-        q_new = torch.where(a.abs() < 1e-6, q_zero_alpha, q_general).clamp_min(0.0)
+        # Force sensitive scalar dynamics into FP32
+        work_dtype = torch.float32
+        u_f = u.to(work_dtype)
+        v_f = v.to(work_dtype)
+        a_f = (2.0 * alpha).to(work_dtype)
+        b_f = (2.0 * beta).to(work_dtype).clamp_min(1e-6)
 
-        scale = torch.sqrt(q_new / q.clamp_min(eps))
-        return u * scale, v * scale
+        q = (u_f * u_f + v_f * v_f).clamp(max=1e4)
+        
+        exp_term = torch.exp((-a_f * dt).clamp(min=-20.0, max=20.0))
+        denom = (b_f * q + (a_f - b_f * q) * exp_term).clamp_min(eps)
+
+        q_general = (a_f * q) / denom
+        q_zero_alpha = q / (1.0 + b_f * q * dt)
+        q_new = torch.where(a_f.abs() < 1e-4, q_zero_alpha, q_general)
+        q_new = q_new.clamp(min=0.0, max=1e4)
+
+        scale = torch.sqrt((q_new / q.clamp_min(eps)).clamp(min=0.0, max=1e4))
+        
+        # Cast back to original dtype before returning
+        return (u_f * scale).to(u.dtype), (v_f * scale).to(v.dtype)
 
     def _leapfrog_hamiltonian_step(
         self,
@@ -147,7 +156,7 @@ class RealSymplecticReactionDiffusion2D(nn.Module):
 
         # Keep dtype native to the incoming activation so BF16 on TPU stays fast.
         state_dtype = x.dtype
-        u = x.transpose(1, 2).reshape(bsz, d_inner, h, w).to(state_dtype)
+        u = x.transpose(1, 2).contiguous().view(bsz, d_inner, h, w).to(state_dtype)
         v = torch.zeros_like(u)
 
         gamma = gamma.to(state_dtype)
@@ -160,8 +169,8 @@ class RealSymplecticReactionDiffusion2D(nn.Module):
             u, v = self._leapfrog_hamiltonian_step(u, v, gamma, dt)
             u, v = self._exact_reaction_step(u, v, alpha, beta, half_dt)
 
-        u = u.reshape(bsz, d_inner, num_tokens).transpose(1, 2)
-        v = v.reshape(bsz, d_inner, num_tokens).transpose(1, 2)
+        u = u.contiguous().view(bsz, d_inner, num_tokens).transpose(1, 2)
+        v = v.contiguous().view(bsz, d_inner, num_tokens).transpose(1, 2)
         combined = torch.cat([u, v], dim=-1)
         return self.out_complex(combined) + x * self.D.to(x.dtype)
 
@@ -197,9 +206,9 @@ class ContinuousSpatialMambaBlock_V5(nn.Module):
         xz = self.in_proj(self.norm(x))
         u, z = xz.chunk(2, dim=-1)
 
-        u_2d = u.transpose(1, 2).reshape(bsz, -1, h, w)
+        u_2d = u.transpose(1, 2).contiguous().view(bsz, -1, h, w)
         u_2d = self.local_conv2d(u_2d)
-        u = u_2d.reshape(bsz, -1, num_tokens).transpose(1, 2)
+        u = u_2d.contiguous().view(bsz, -1, num_tokens).transpose(1, 2)
         u = self.activation(u)
 
         y_ssm = self.ssm(u, k_steps=k_steps)
