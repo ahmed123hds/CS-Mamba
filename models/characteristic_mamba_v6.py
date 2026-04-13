@@ -20,6 +20,7 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +309,7 @@ class CSMamba_V6(nn.Module):
         k_steps = getattr(cfg, "K_steps", 4)
         drop_path_rate = getattr(cfg, "drop_path", 0.1)
         n_flow_groups = getattr(cfg, "n_flow_groups", 4)
+        self.use_checkpoint = getattr(cfg, "use_checkpoint", True)
 
         self.k_steps = k_steps
         num_patches = (img_size // patch_size) ** 2
@@ -336,7 +338,11 @@ class CSMamba_V6(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.patch_embed(x).flatten(2).transpose(1, 2) + self.pos_embed
         for layer in self.layers:
-            x = layer(x, k_steps=self.k_steps)
+            if self.training and self.use_checkpoint:
+                # Use gradient checkpointing to massively reduce memory footprint at the cost of ~20% compute
+                x = checkpoint(layer, x, self.k_steps, use_reentrant=False)
+            else:
+                x = layer(x, k_steps=self.k_steps)
         return self.head(self.final_norm(x).mean(dim=1))
 
 
