@@ -61,13 +61,13 @@ def cs_mamba_forward_v4(h_real, h_imag, delta_d, diffusion_conv,
     for _ in range(K):
         # ── Learned spatial operator on REAL part → feeds IMAG ────
         h_r_2d = h_real.transpose(1, 2).view(B_val, D_dim, H, W)
-        h_r_pad = F.pad(h_r_2d, (1, 1, 1, 1), mode='replicate')
+        h_r_pad = F.pad(h_r_2d, (1, 1, 1, 1), mode='constant', value=0.0)
         lap_real = diffusion_conv(h_r_pad)          # (B, D, H, W)
         lap_real = lap_real.view(B_val, D_dim, N).transpose(1, 2)  # (B, N, D)
 
         # ── Learned spatial operator on IMAG part → feeds REAL ────
         h_i_2d = h_imag.transpose(1, 2).view(B_val, D_dim, H, W)
-        h_i_pad = F.pad(h_i_2d, (1, 1, 1, 1), mode='replicate')
+        h_i_pad = F.pad(h_i_2d, (1, 1, 1, 1), mode='constant', value=0.0)
         lap_imag = diffusion_conv(h_i_pad)
         lap_imag = lap_imag.view(B_val, D_dim, N).transpose(1, 2)
 
