@@ -18,7 +18,6 @@ import time
 import math
 import argparse
 import random
-import gc
 from dataclasses import dataclass
 
 import numpy as np
@@ -199,7 +198,7 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
         num_workers=flags.num_workers,
         pin_memory=True,
         prefetch_factor=2 if flags.num_workers > 0 else None,
-        persistent_workers=False,
+        persistent_workers=flags.num_workers > 0,
     )
 
 
@@ -263,12 +262,12 @@ def build_tiny_loader(flags, is_training=True):
         num_workers=flags.num_workers,
         drop_last=is_training,
         pin_memory=True,
-        persistent_workers=False,
+        persistent_workers=flags.num_workers > 0,
         collate_fn=mixup_collate if is_training else None,
     )
 
 
-def _maybe_autocast(flags):
+def _autocast_ctx(flags):
     if flags.amp_bf16:
         return torch.autocast(device_type="xla", dtype=torch.bfloat16)
     return torch.autocast(device_type="xla", enabled=False)
@@ -344,15 +343,14 @@ def _mp_fn(index, flags):
     xm.master_print(f"Scaled LR: {scaled_lr:.6f} | AMP BF16: {flags.amp_bf16} | Flow Groups: {flags.n_flow_groups}")
     xm.master_print(f"{'='*72}\n")
 
-    autocast_ctx = _maybe_autocast(flags)
+    # Keep device loaders alive for the whole run instead of repeatedly
+    # tearing down worker pools each epoch. This matches the stable V4 path.
+    para_train = pl.MpDeviceLoader(train_loader, device)
+    para_val = pl.MpDeviceLoader(val_loader, device)
 
     for epoch in range(start_epoch, flags.epochs + 1):
         if not is_imagenet:
             train_loader.sampler.set_epoch(epoch)
-
-        # ── Create per-epoch ParallelLoader (proven pattern from V4 70+ epochs) ──
-        pl_train = pl.ParallelLoader(train_loader, [device])
-        para_train = pl_train.per_device_loader(device)
 
         model.train()
         tracker = xm.RateTracker()
@@ -364,7 +362,7 @@ def _mp_fn(index, flags):
                 break
             images, labels_a, labels_b, lam = batch
             optimizer.zero_grad(set_to_none=True)
-            with autocast_ctx:
+            with _autocast_ctx(flags):
                 logits = model(images)
                 loss = mixup_criterion(criterion, logits, labels_a, labels_b, lam)
             loss.backward()
@@ -388,14 +386,6 @@ def _mp_fn(index, flags):
         g_loss = xm.mesh_reduce("tr_loss", total_loss, np.sum) / g_total
         g_acc = 100.0 * xm.mesh_reduce("tr_c", total_correct, np.sum) / g_total
 
-        # ── Cleanup train loader ──
-        del para_train, pl_train
-        gc.collect()
-
-        # ── Validation ──
-        pl_val = pl.ParallelLoader(val_loader, [device])
-        para_val = pl_val.per_device_loader(device)
-
         model.eval()
         v_correct, v_total = 0, 0
         t1 = time.time()
@@ -404,7 +394,7 @@ def _mp_fn(index, flags):
                 break
             images, labels = batch
             with torch.no_grad():
-                with autocast_ctx:
+                with _autocast_ctx(flags):
                     logits = model(images)
             v_correct += logits.argmax(1).eq(labels).sum().item()
             v_total += images.size(0)
@@ -414,10 +404,6 @@ def _mp_fn(index, flags):
         v_acc = 100.0 * xm.mesh_reduce("v_c", v_correct, np.sum) / max(xm.mesh_reduce("v_n", v_total, np.sum), 1)
         scheduler.step()
 
-        # ── Cleanup val loader ──
-        del para_val, pl_val
-        gc.collect()
-
         xm.master_print(
             f"\nEpoch {epoch:03d}/{flags.epochs} | "
             f"Train {g_acc:.1f}% (loss {g_loss:.4f}) | Val {v_acc:.1f}% | "
@@ -425,6 +411,9 @@ def _mp_fn(index, flags):
         )
 
         # Checkpointing
+        if v_acc > best_acc:
+            best_acc = v_acc
+
         ckpt = {
             "epoch": epoch,
             "state_dict": model.state_dict(),
@@ -434,15 +423,12 @@ def _mp_fn(index, flags):
             "val_acc": v_acc,
         }
         latest_path = os.path.join(flags.save_dir, f"csmamba_v6_{flags.dataset}_latest.pt")
-        
-        if xm.is_master_ordinal():
-            xm.save(ckpt, latest_path)
 
-        if v_acc > best_acc:
-            best_acc = v_acc
+        xm.save(ckpt, latest_path, master_only=True, global_master=True)
+
+        if abs(v_acc - best_acc) < 1e-12:
             best_path = os.path.join(flags.save_dir, f"csmamba_v6_{flags.dataset}_best.pt")
-            if xm.is_master_ordinal():
-                xm.save(ckpt, best_path)
+            xm.save(ckpt, best_path, master_only=True, global_master=True)
             xm.master_print(f"New best! Val Acc: {best_acc:.2f}% saved to {best_path}")
 
     xm.master_print(f"Training complete. Best Val Acc: {best_acc:.2f}%")
