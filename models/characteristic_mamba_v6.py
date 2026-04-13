@@ -340,7 +340,7 @@ class CSMamba_V6(nn.Module):
         for layer in self.layers:
             if self.training and self.use_checkpoint:
                 # Use gradient checkpointing to massively reduce memory footprint at the cost of ~20% compute
-                x = checkpoint(layer, x, self.k_steps, use_reentrant=False)
+                x = checkpoint(layer, x, self.k_steps)
             else:
                 x = layer(x, k_steps=self.k_steps)
         return self.head(self.final_norm(x).mean(dim=1))
