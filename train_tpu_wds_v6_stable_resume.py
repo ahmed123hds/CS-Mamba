@@ -92,6 +92,7 @@ def parse_args():
     # Checkpoint
     p.add_argument("--resume", type=str, default="")
     p.add_argument("--resume_model_only", action="store_true", help="Resume only the model weights, reset optimizer/scheduler and start from epoch 1")
+    p.add_argument("--eval_only", action="store_true", help="Run evaluation only")
     p.add_argument("--save_dir", type=str, default=".")
     p.add_argument("--save_every", type=int, default=10)
 
@@ -150,6 +151,17 @@ def build_lr_scheduler(optimizer, flags, scaled_lr):
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def xla_nodesplitter(urls):
+    import torch_xla.core.xla_model as xm
+    try:
+        rank = xm.get_ordinal()
+        world_size = xm.xrt_world_size()
+    except Exception:
+        rank = 0
+        world_size = 1
+    return urls[rank::world_size]
+
+
 def build_wds_loader(shards_url, batch_size, flags, is_training=True):
     if is_training:
         transform = T.Compose([
@@ -191,7 +203,7 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
                 shards_url,
                 resampled=True,
                 shardshuffle=1000,
-                nodesplitter=wds.split_by_node,
+                nodesplitter=xla_nodesplitter,
             )
             .shuffle(5000)
             .decode("pil")
@@ -206,7 +218,7 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
                 shards_url,
                 resampled=False,
                 shardshuffle=False,
-                nodesplitter=wds.split_by_node,
+                nodesplitter=xla_nodesplitter,
             )
             .decode("pil")
             .to_tuple("jpg;png;jpeg", "cls")
@@ -376,6 +388,28 @@ def _mp_fn(index, flags):
 
     para_train = pl.MpDeviceLoader(train_loader, device)
     para_val = pl.MpDeviceLoader(val_loader, device)
+
+    if flags.eval_only:
+        xm.master_print("=== RUNNING EVAL ONLY ===")
+        model.eval()
+        v_correct, v_total = 0, 0
+        t1 = time.time()
+        for step, batch in enumerate(para_val):
+            if step >= val_steps:
+                break
+            images, labels = batch
+            with torch.no_grad():
+                with autocast_ctx:
+                    logits = model(images)
+            v_correct += logits.argmax(1).eq(labels).sum().item()
+            v_total += images.size(0)
+            xm.mark_step()
+            
+        val_time = time.time() - t1
+        g_v_total = int(max(xm.mesh_reduce("v_n", v_total, np.sum), 1))
+        v_acc = 100.0 * xm.mesh_reduce("v_c", v_correct, np.sum) / g_v_total
+        xm.master_print(f"Eval results: Val Acc: {v_acc:.2f}% | Total Processed: {g_v_total} | Time: {val_time:.0f}s")
+        return
 
     for epoch in range(start_epoch, flags.epochs + 1):
         if not is_imagenet:
