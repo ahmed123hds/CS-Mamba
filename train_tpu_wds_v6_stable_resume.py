@@ -91,6 +91,7 @@ def parse_args():
 
     # Checkpoint
     p.add_argument("--resume", type=str, default="")
+    p.add_argument("--resume_model_only", action="store_true", help="Resume only the model weights, reset optimizer/scheduler and start from epoch 1")
     p.add_argument("--save_dir", type=str, default=".")
     p.add_argument("--save_every", type=int, default=10)
 
