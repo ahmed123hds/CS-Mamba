@@ -159,6 +159,7 @@ def xla_nodesplitter(urls):
     except Exception:
         rank = 0
         world_size = 1
+    urls = list(urls)
     return urls[rank::world_size]
 
 
