@@ -368,7 +368,7 @@ def _mp_fn(index, flags):
     xm.master_print(f"CS-Mamba V6 (Characteristic Mamba) | Params: {n_params/1e6:.1f}M")
     xm.master_print(f"World Size: {world_size} TPU cores | Global BS: {global_bs}")
     xm.master_print(f"Scaled LR: {scaled_lr:.6f} | AMP BF16: {flags.amp_bf16} | Flow Groups: {flags.n_flow_groups}")
-        print(f"Actual optimizer LR now: {optimizer.param_groups[0]['lr']:.6f}")
+    print(f"Actual optimizer LR now: {optimizer.param_groups[0]['lr']:.6f}")
     xm.master_print(f"{'='*72}\n")
 
     autocast_ctx = _maybe_autocast(flags)
