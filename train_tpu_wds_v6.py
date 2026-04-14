@@ -18,6 +18,7 @@ import time
 import math
 import argparse
 import random
+import gc
 from dataclasses import dataclass
 
 import numpy as np
@@ -198,7 +199,7 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
         num_workers=flags.num_workers,
         pin_memory=True,
         prefetch_factor=2 if flags.num_workers > 0 else None,
-        persistent_workers=flags.num_workers > 0,
+        persistent_workers=False,
     )
 
 
@@ -262,7 +263,7 @@ def build_tiny_loader(flags, is_training=True):
         num_workers=flags.num_workers,
         drop_last=is_training,
         pin_memory=True,
-        persistent_workers=flags.num_workers > 0,
+        persistent_workers=False,
         collate_fn=mixup_collate if is_training else None,
     )
 
@@ -343,14 +344,12 @@ def _mp_fn(index, flags):
     xm.master_print(f"Scaled LR: {scaled_lr:.6f} | AMP BF16: {flags.amp_bf16} | Flow Groups: {flags.n_flow_groups}")
     xm.master_print(f"{'='*72}\n")
 
-    # Keep device loaders alive for the whole run instead of repeatedly
-    # tearing down worker pools each epoch. This matches the stable V4 path.
-    para_train = pl.MpDeviceLoader(train_loader, device)
-    para_val = pl.MpDeviceLoader(val_loader, device)
-
     for epoch in range(start_epoch, flags.epochs + 1):
         if not is_imagenet:
             train_loader.sampler.set_epoch(epoch)
+
+        pl_train = pl.ParallelLoader(train_loader, [device])
+        para_train = pl_train.per_device_loader(device)
 
         model.train()
         tracker = xm.RateTracker()
@@ -386,6 +385,12 @@ def _mp_fn(index, flags):
         g_loss = xm.mesh_reduce("tr_loss", total_loss, np.sum) / g_total
         g_acc = 100.0 * xm.mesh_reduce("tr_c", total_correct, np.sum) / g_total
 
+        del para_train, pl_train
+        gc.collect()
+
+        pl_val = pl.ParallelLoader(val_loader, [device])
+        para_val = pl_val.per_device_loader(device)
+
         model.eval()
         v_correct, v_total = 0, 0
         t1 = time.time()
@@ -403,6 +408,9 @@ def _mp_fn(index, flags):
         val_time = time.time() - t1
         v_acc = 100.0 * xm.mesh_reduce("v_c", v_correct, np.sum) / max(xm.mesh_reduce("v_n", v_total, np.sum), 1)
         scheduler.step()
+
+        del para_val, pl_val
+        gc.collect()
 
         xm.master_print(
             f"\nEpoch {epoch:03d}/{flags.epochs} | "
