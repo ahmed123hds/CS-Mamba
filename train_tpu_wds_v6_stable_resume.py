@@ -205,6 +205,7 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
                 resampled=True,
                 shardshuffle=1000,
                 nodesplitter=xla_nodesplitter,
+                empty_check=False,
             )
             .shuffle(5000)
             .decode("pil")
@@ -220,6 +221,7 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
                 resampled=False,
                 shardshuffle=False,
                 nodesplitter=xla_nodesplitter,
+                empty_check=False,
             )
             .decode("pil")
             .to_tuple("jpg;png;jpeg", "cls")
