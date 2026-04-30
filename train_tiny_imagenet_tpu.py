@@ -51,7 +51,8 @@ from models.vmamba_4d import VMamba4D
 # ─────────────────────────────────────────────────────────
 def mixup_data(x, y, alpha=0.8):
     lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
-    index = torch.randperm(x.size(0), device=x.device)
+    # Generate on CPU — XLA/TPU does not support s64 rng_uniform (int64 randperm on device)
+    index = torch.randperm(x.size(0))
     mixed_x = lam * x + (1 - lam) * x[index]
     return mixed_x, y, y[index], lam
 
@@ -59,7 +60,8 @@ def mixup_data(x, y, alpha=0.8):
 def cutmix_data(x, y, alpha=1.0):
     lam = np.random.beta(alpha, alpha)
     B, _, H, W = x.size()
-    index = torch.randperm(B, device=x.device)
+    # Generate on CPU — XLA/TPU does not support s64 rng_uniform (int64 randperm on device)
+    index = torch.randperm(B)
     cut_rat = math.sqrt(1.0 - lam)
     cut_w, cut_h = int(W * cut_rat), int(H * cut_rat)
     cx, cy = random.randint(0, W), random.randint(0, H)
