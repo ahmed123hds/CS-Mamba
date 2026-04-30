@@ -7,6 +7,8 @@ and DeiT-level regularization.
 
 Usage (on TPU VM):
   python train_tiny_imagenet_tpu.py --mode v6         # V6 only
+  python train_tiny_imagenet_tpu.py --mode vmamba     # VMamba-style 4D scan baseline
+  python train_tiny_imagenet_tpu.py --mode v6_vmamba  # V6 vs VMamba baseline
   python train_tiny_imagenet_tpu.py --mode v2         # V2 only
   python train_tiny_imagenet_tpu.py --mode v1         # V1 only
   python train_tiny_imagenet_tpu.py --mode compare    # Head-to-head V1-V6
@@ -36,6 +38,7 @@ from models.continuous_spatial_mamba_v2 import CSMamba_V2
 from models.continuous_spatial_mamba_v3 import CSMamba_V3
 from models.continuous_spatial_mamba_v4 import CSMamba_V4
 from models.characteristic_mamba_v6 import CSMamba_V6
+from models.vmamba_4d import VMamba4D
 
 
 # ─────────────────────────────────────────────────────────
@@ -201,7 +204,7 @@ def train_model(name, model, train_loader_raw, train_sampler, val_loader_raw, cf
             f"Time {t_ep:4.1f}s | LR {scheduler.get_last_lr()[0]:.2e}"
         )
 
-    xm.master_print(f"\n  ✓ Best Val Acc: {best_acc:.2f}%\n")
+    xm.master_print(f"\n  \u2713 Best Val Acc: {best_acc:.2f}%\n")
     return best_acc
 
 
@@ -219,6 +222,7 @@ def _mp_fn(index, flags):
     xm.master_print(f"{'='*60}")
     xm.master_print(f"  V1: Collapsed diffusion (sum over S, manual slicing)")
     xm.master_print(f"  V2: State-preserving diffusion (per-S, F.conv2d)")
+    xm.master_print(f"  VMamba4D: Fixed 4-route SS2D/Cross-Scan baseline")
     xm.master_print(f"  V6: Characteristic transport with self+8 routing")
     xm.master_print(f"{'='*60}\n")
 
@@ -308,7 +312,14 @@ def _mp_fn(index, flags):
         del model_v4
         xm.mark_step()
 
-    if flags.mode in ('v6', 'compare'):
+    if flags.mode in ('vmamba', 'v6_vmamba', 'compare'):
+        model_vmamba = VMamba4D(flags).to(device)
+        results['VMamba4D'] = train_model(
+            'VMamba4D', model_vmamba, train_loader_raw, train_sampler, val_loader_raw, flags, device)
+        del model_vmamba
+        xm.mark_step()
+
+    if flags.mode in ('v6', 'v6_vmamba', 'compare'):
         model_v6 = CSMamba_V6(flags).to(device)
         results['CSMamba_V6'] = train_model(
             'CSMamba_V6', model_v6, train_loader_raw, train_sampler, val_loader_raw, flags, device)
@@ -330,8 +341,12 @@ def _mp_fn(index, flags):
 #  Args & Entry
 # ─────────────────────────────────────────────────────────
 def parse_args():
-    p = argparse.ArgumentParser("CS-Mamba V1/V2/V3/V4/V6 — Tiny-ImageNet (TPU)")
-    p.add_argument('--mode',           choices=['v1', 'v2', 'v3', 'v4', 'v6', 'compare'], default='v6')
+    p = argparse.ArgumentParser("CS-Mamba V1/V2/V3/V4/V6 + VMamba4D — Tiny-ImageNet (TPU)")
+    p.add_argument(
+        '--mode',
+        choices=['v1', 'v2', 'v3', 'v4', 'v6', 'vmamba', 'v6_vmamba', 'compare'],
+        default='v6',
+    )
     p.add_argument('--img_size',       type=int,   default=64)
     p.add_argument('--patch_size',     type=int,   default=4)
     p.add_argument('--n_classes',      type=int,   default=200)
