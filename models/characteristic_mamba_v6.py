@@ -4,7 +4,7 @@ Characteristic Mamba V6 — Selective 2D Characteristic Transport
 Key ideas (from char_mamba_methodology.pdf):
   1. Learn a per-location transport direction via a stream function ψ
      whose curl gives a divergence-free velocity field.
-  2. Convert velocity + learned self score to 9-direction routing weights.
+  2. Convert state-derived velocity + learned self score to 9-direction routing weights.
   3. Transport paired state (U, V) by directional projected neighbor gathering.
   4. Optionally rotate the (U, V) pair by a learned phase angle Θ
      to retain V4's oscillatory channel coupling intuition.
@@ -52,7 +52,7 @@ class CharacteristicTransport2D(nn.Module):
     Selective 2D characteristic transport on the image plane.
 
     For T substeps, this module:
-      1. Predicts a stream function ψ → derives divergence-free velocity (vx, vy)
+      1. Predicts a stream function ψ from the current state → derives velocity
       2. Converts velocity + learned self score to 9-direction routing weights
       3. Transports paired state (U, V) via directional projected neighbor gather
       4. Applies optional phase rotation on (U, V) pairs
@@ -233,19 +233,7 @@ class CharacteristicTransport2D(nn.Module):
         u = u.permute(0, 2, 1).unflatten(2, (h, w))                # (B, D, H, W)
         v = v.permute(0, 2, 1).unflatten(2, (h, w))
 
-        # --- Precompute conditioning (stays fixed across substeps) ---
-        # Stream function
-        psi = self.stream_head(x)                                   # (B, N, G)
-        psi = psi.permute(0, 2, 1).unflatten(2, (h, w))            # (B, G, H, W)
-        self_logits = self.self_route_head(x)
-        self_logits = self_logits.permute(0, 2, 1).unflatten(2, (h, w))
-
-        # Velocity from curl of stream function
-        vx, vy = self._stream_to_velocity(psi)
-
-        # Routing weights (self + 8-neighbor softmax)
-        routing = self._velocity_to_routing(vx, vy, self_logits)    # (B, G, 9, H, W)
-
+        # --- Input-conditioned terms that stay fixed across substeps ---
         # Phase angle
         theta = self.phase_head(x)                                  # (B, N, D)
         theta = theta.permute(0, 2, 1).unflatten(2, (h, w))        # (B, D, H, W)
@@ -265,6 +253,17 @@ class CharacteristicTransport2D(nn.Module):
 
         # --- Recurrent transport loop ---
         for _ in range(int(k_steps)):
+            # 0. Recompute routing from the evolving U state.
+            # This makes each characteristic substep state-dependent instead
+            # of repeatedly applying one frozen transport operator.
+            u_tokens = u.flatten(2).permute(0, 2, 1)
+            psi = self.stream_head(u_tokens)
+            psi = psi.permute(0, 2, 1).unflatten(2, (h, w))
+            self_logits = self.self_route_head(u_tokens)
+            self_logits = self_logits.permute(0, 2, 1).unflatten(2, (h, w))
+            vx, vy = self._stream_to_velocity(psi)
+            routing = self._velocity_to_routing(vx, vy, self_logits)
+
             # 1. Transport state along learned flow
             u_hat = self._transport(u, routing)
             v_hat = self._transport(v, routing)
