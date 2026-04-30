@@ -53,8 +53,12 @@ def mixup_data(x, y, alpha=0.8):
     lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
     # Generate on CPU — XLA/TPU does not support s64 rng_uniform (int64 randperm on device)
     index = torch.randperm(x.size(0))
-    mixed_x = lam * x + (1 - lam) * x[index]
-    return mixed_x, y, y[index], lam
+    
+    # Convert lam to a tensor to prevent XLA from burning a changing float 
+    # constant into the graph, which causes recompilation every batch.
+    lam_t = torch.tensor(lam, device=x.device, dtype=x.dtype)
+    mixed_x = lam_t * x + (1.0 - lam_t) * x[index]
+    return mixed_x, y, y[index], lam_t
 
 
 def cutmix_data(x, y, alpha=1.0):
@@ -67,18 +71,21 @@ def cutmix_data(x, y, alpha=1.0):
     cx, cy = random.randint(0, W), random.randint(0, H)
     x1, x2 = max(cx - cut_w // 2, 0), min(cx + cut_w // 2, W)
     y1, y2 = max(cy - cut_h // 2, 0), min(cy + cut_h // 2, H)
-    # Use a fixed-shape mask instead of dynamic slice assignment
-    # to avoid XLA recompilation from varying cut dimensions each step
-    row_mask = (torch.arange(H, device=x.device) >= y1) & (torch.arange(H, device=x.device) < y2)
-    col_mask = (torch.arange(W, device=x.device) >= x1) & (torch.arange(W, device=x.device) < x2)
-    mask = (row_mask[:, None] & col_mask[None, :]).unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+    
+    # Generate the mask entirely on CPU to avoid burning changing Python integers
+    # (y1, y2, x1, x2) into the XLA graph, which causes recompilation every batch.
+    row_mask = (torch.arange(H) >= y1) & (torch.arange(H) < y2)
+    col_mask = (torch.arange(W) >= x1) & (torch.arange(W) < x2)
+    mask = (row_mask[:, None] & col_mask[None, :]).unsqueeze(0).unsqueeze(0).to(x.device)
+    
     mixed_x = torch.where(mask, x[index], x)
-    lam = 1 - (x2 - x1) * (y2 - y1) / (W * H)
-    return mixed_x, y, y[index], lam
+    lam = 1.0 - (x2 - x1) * (y2 - y1) / (W * H)
+    lam_t = torch.tensor(lam, device=x.device, dtype=x.dtype)
+    return mixed_x, y, y[index], lam_t
 
 
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+def mixup_criterion(criterion, pred, y_a, y_b, lam_t):
+    return lam_t * criterion(pred, y_a) + (1.0 - lam_t) * criterion(pred, y_b)
 
 
 # ─────────────────────────────────────────────────────────
