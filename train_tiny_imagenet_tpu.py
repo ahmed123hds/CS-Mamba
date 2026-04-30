@@ -47,45 +47,65 @@ from models.vmamba_4d import VMamba4D
 
 
 # ─────────────────────────────────────────────────────────
-#  Regularization: Mixup + CutMix (CPU-safe, no dynamic shapes)
+#  CPU-side Mixup + CutMix Collate (XLA-safe)
 # ─────────────────────────────────────────────────────────
-def mixup_data(x, y, alpha=0.8):
-    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
-    # Generate on CPU — XLA/TPU does not support s64 rng_uniform (int64 randperm on device)
-    index = torch.randperm(x.size(0))
-    
-    # Convert lam to a tensor to prevent XLA from burning a changing float 
-    # constant into the graph, which causes recompilation every batch.
-    lam_t = torch.tensor(lam, device=x.device, dtype=x.dtype)
-    mixed_x = lam_t * x + (1.0 - lam_t) * x[index]
-    return mixed_x, y, y[index], lam_t
+class MixupCutMixCollate:
+    """
+    Performs Mixup/CutMix entirely on CPU inside the DataLoader collate.
 
+    Why this is the right pattern for XLA/TPU:
+      - All random ops (lam, randperm, coords, mask) happen on CPU.
+      - The TPU receives fixed-shape tensors every step:
+          imgs:    (B, C, H, W)  float32
+          targets: (B, n_classes) float32  ← soft labels
+      - The XLA computation graph NEVER changes → compiles once, full speed.
+      - Eliminates all host-device syncs and dynamic graph branches from the
+        training step that were causing constant recompilation.
 
-def cutmix_data(x, y, alpha=1.0):
-    lam = np.random.beta(alpha, alpha)
-    B, _, H, W = x.size()
-    # Generate on CPU — XLA/TPU does not support s64 rng_uniform (int64 randperm on device)
-    index = torch.randperm(B)
-    cut_rat = math.sqrt(1.0 - lam)
-    cut_w, cut_h = int(W * cut_rat), int(H * cut_rat)
-    cx, cy = random.randint(0, W), random.randint(0, H)
-    x1, x2 = max(cx - cut_w // 2, 0), min(cx + cut_w // 2, W)
-    y1, y2 = max(cy - cut_h // 2, 0), min(cy + cut_h // 2, H)
-    
-    # Generate the mask entirely on CPU to avoid burning changing Python integers
-    # (y1, y2, x1, x2) into the XLA graph, which causes recompilation every batch.
-    row_mask = (torch.arange(H) >= y1) & (torch.arange(H) < y2)
-    col_mask = (torch.arange(W) >= x1) & (torch.arange(W) < x2)
-    mask = (row_mask[:, None] & col_mask[None, :]).unsqueeze(0).unsqueeze(0).to(x.device)
-    
-    mixed_x = torch.where(mask, x[index], x)
-    lam = 1.0 - (x2 - x1) * (y2 - y1) / (W * H)
-    lam_t = torch.tensor(lam, device=x.device, dtype=x.dtype)
-    return mixed_x, y, y[index], lam_t
+    CrossEntropyLoss accepts (B, C) float targets natively (PyTorch >= 1.10).
+    """
+    def __init__(self, n_classes: int, mixup_alpha: float = 0.8,
+                 cutmix_alpha: float = 1.0, p_cutmix: float = 0.5):
+        self.n_classes   = n_classes
+        self.mixup_alpha = mixup_alpha
+        self.cutmix_alpha = cutmix_alpha
+        self.p_cutmix    = p_cutmix
 
+    def _one_hot(self, labels: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(len(labels), self.n_classes).scatter_(
+            1, labels.unsqueeze(1), 1.0)
 
-def mixup_criterion(criterion, pred, y_a, y_b, lam_t):
-    return lam_t * criterion(pred, y_a) + (1.0 - lam_t) * criterion(pred, y_b)
+    def _mixup(self, imgs: torch.Tensor, labels: torch.Tensor):
+        lam = float(np.random.beta(self.mixup_alpha, self.mixup_alpha))
+        idx = torch.randperm(len(imgs))  # CPU — avoids XLA s64 rng_uniform
+        mixed = lam * imgs + (1.0 - lam) * imgs[idx]
+        soft  = lam * self._one_hot(labels) + (1.0 - lam) * self._one_hot(labels[idx])
+        return mixed, soft
+
+    def _cutmix(self, imgs: torch.Tensor, labels: torch.Tensor):
+        B, C, H, W = imgs.shape
+        lam = float(np.random.beta(self.cutmix_alpha, self.cutmix_alpha))
+        idx = torch.randperm(B)          # CPU — avoids XLA s64 rng_uniform
+        cut_rat = math.sqrt(1.0 - lam)
+        cut_w = int(W * cut_rat);  cut_h = int(H * cut_rat)
+        cx = random.randint(0, W); cy = random.randint(0, H)
+        x1 = max(cx - cut_w // 2, 0);  x2 = min(cx + cut_w // 2, W)
+        y1 = max(cy - cut_h // 2, 0);  y2 = min(cy + cut_h // 2, H)
+        # Clone + slice entirely on CPU — TPU only receives the finished tensor
+        mixed = imgs.clone()
+        mixed[:, :, y1:y2, x1:x2] = imgs[idx, :, y1:y2, x1:x2]
+        lam   = 1.0 - (x2 - x1) * (y2 - y1) / (W * H)
+        soft  = lam * self._one_hot(labels) + (1.0 - lam) * self._one_hot(labels[idx])
+        return mixed, soft
+
+    def __call__(self, batch):
+        imgs, labels = zip(*batch)
+        imgs   = torch.stack(imgs)                             # (B, C, H, W)
+        labels = torch.tensor(labels, dtype=torch.long)        # (B,)
+        if random.random() < self.p_cutmix:
+            return self._cutmix(imgs, labels)
+        else:
+            return self._mixup(imgs, labels)
 
 
 # ─────────────────────────────────────────────────────────
@@ -125,48 +145,23 @@ def train_one_epoch(model, train_loader_raw, train_sampler, optimizer, criterion
     t0 = time.time()
     total_steps = len(train_loader_raw)
     running_correct = torch.tensor(0, dtype=torch.long, device=device)
-    running_total = torch.tensor(0, dtype=torch.long, device=device)
+    running_total   = torch.tensor(0, dtype=torch.long, device=device)
     debug_first_step = getattr(cfg, "debug_first_step", False)
-    use_mixup = getattr(cfg, "use_mixup", True)
     grad_clip = getattr(cfg, "grad_clip", 1.0)
 
-    for step, (imgs, labels) in enumerate(loader):
+    for step, (imgs, targets) in enumerate(loader):
         if debug_first_step and step == 0:
             dbg_t = time.time()
             xm.master_print("    [debug] first batch received")
 
         optimizer.zero_grad()
-        if debug_first_step and step == 0:
-            xm.master_print(f"    [debug] zero_grad done ({time.time() - dbg_t:.2f}s)")
-            dbg_t = time.time()
-
-        # --- Mixup / CutMix regularization (50/50 random each step) ---
-        applied_mix = False
-        if use_mixup and model.training:
-            if random.random() < 0.5:
-                imgs, targets_a, targets_b, lam = mixup_data(imgs, labels, alpha=0.8)
-                applied_mix = True
-            else:
-                imgs, targets_a, targets_b, lam = cutmix_data(imgs, labels, alpha=1.0)
-                applied_mix = True
 
         outs = model(imgs)
-        if debug_first_step and step == 0:
-            xm.master_print(f"    [debug] forward returned ({time.time() - dbg_t:.2f}s)")
-            dbg_t = time.time()
-
-        if applied_mix:
-            loss = mixup_criterion(criterion, outs, targets_a, targets_b, lam)
-        else:
-            loss = criterion(outs, labels)
-        if debug_first_step and step == 0:
-            xm.master_print(f"    [debug] loss built ({time.time() - dbg_t:.2f}s)")
-            dbg_t = time.time()
+        # targets can be (B,) hard labels OR (B, C) soft labels from collate.
+        # CrossEntropyLoss handles both natively (PyTorch >= 1.10).
+        loss = criterion(outs, targets)
 
         loss.backward()
-        if debug_first_step and step == 0:
-            xm.master_print(f"    [debug] backward returned ({time.time() - dbg_t:.2f}s)")
-            dbg_t = time.time()
 
         # Gradient clipping for training stability
         if grad_clip > 0:
@@ -174,13 +169,14 @@ def train_one_epoch(model, train_loader_raw, train_sampler, optimizer, criterion
 
         xm.optimizer_step(optimizer)
         if debug_first_step and step == 0:
-            xm.master_print(f"    [debug] optimizer_step returned ({time.time() - dbg_t:.2f}s)")
+            xm.master_print(f"    [debug] optimizer_step done ({time.time() - dbg_t:.2f}s)")
 
         tracker.add(cfg.batch_size)
 
-        # Accumulate on-device (no .item() sync!)
-        running_correct += (outs.argmax(1) == labels).sum()
-        running_total += labels.size(0)
+        # Accuracy: for soft labels use argmax as proxy hard label
+        hard = targets.argmax(1) if targets.dim() == 2 else targets
+        running_correct += (outs.argmax(1) == hard).sum()
+        running_total   += imgs.size(0)
 
         if step % 50 == 0:
             xm.add_step_closure(
@@ -325,10 +321,13 @@ def _mp_fn(index, flags):
         shuffle=False
     )
 
+    use_mixup = not getattr(flags, 'no_mixup', False)
+    mixup_collate = MixupCutMixCollate(n_classes=flags.n_classes) if use_mixup else None
+
     train_loader_raw = DataLoader(
         train_ds, batch_size=flags.batch_size,
         sampler=train_sampler, num_workers=0,
-        drop_last=True
+        drop_last=True, collate_fn=mixup_collate,
     )
     val_loader_raw = DataLoader(
         val_ds, batch_size=flags.batch_size,
