@@ -62,7 +62,8 @@ class CharacteristicTransport2D(nn.Module):
     F.pad, softmax) — no FFT, no complex dtype, fully XLA/TPU safe.
     """
 
-    def __init__(self, d_model: int, expand: int = 2, n_flow_groups: int = 4):
+    def __init__(self, d_model: int, expand: int = 2, n_flow_groups: int = 4,
+                 proj_drop: float = 0.0):
         super().__init__()
         d_inner = int(expand * d_model)
         self.d_inner = d_inner
@@ -103,6 +104,7 @@ class CharacteristicTransport2D(nn.Module):
         # --- Output: project (U, V) back to d_inner + skip ---
         self.out_proj = nn.Linear(d_inner * 2, d_inner, bias=False)
         self.D = nn.Parameter(torch.ones(d_inner))
+        self.proj_drop = nn.Dropout(proj_drop)
 
         # Init gate to be mildly retentive at start:
         # softplus(-1.5) ≈ 0.20, exp(-0.20) ≈ 0.82 retain / 0.18 inject.
@@ -280,7 +282,7 @@ class CharacteristicTransport2D(nn.Module):
         v_out = v.flatten(2).permute(0, 2, 1)
 
         combined = torch.cat([u_out, v_out], dim=-1)                # (B, N, 2D)
-        return self.out_proj(combined) + x * self.D
+        return self.proj_drop(self.out_proj(combined)) + x * self.D
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +293,7 @@ class CharacteristicMambaBlock_V6(nn.Module):
     """Drop-in block wrapping the characteristic transport operator."""
 
     def __init__(self, d_model: int, expand: int = 2, drop_path: float = 0.0,
-                 n_flow_groups: int = 4):
+                 n_flow_groups: int = 4, proj_drop: float = 0.0):
         super().__init__()
         d_inner = int(expand * d_model)
         self.norm = nn.LayerNorm(d_model)
@@ -302,8 +304,10 @@ class CharacteristicMambaBlock_V6(nn.Module):
         self.activation = nn.SiLU()
         self.ssm = CharacteristicTransport2D(
             d_model=d_model, expand=expand, n_flow_groups=n_flow_groups,
+            proj_drop=proj_drop,
         )
         self.out_proj = nn.Linear(d_inner, d_model, bias=False)
+        self.proj_drop = nn.Dropout(proj_drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor, k_steps: int = 4) -> torch.Tensor:
@@ -321,7 +325,7 @@ class CharacteristicMambaBlock_V6(nn.Module):
         u = self.activation(u)
 
         y_ssm = self.ssm(u, k_steps=k_steps)
-        out = self.out_proj(y_ssm * F.silu(z))
+        out = self.proj_drop(self.out_proj(y_ssm * F.silu(z)))
         return residual + self.drop_path(out)
 
 
@@ -348,6 +352,8 @@ class CSMamba_V6(nn.Module):
         k_steps = getattr(cfg, "K_steps", 4)
         drop_path_rate = getattr(cfg, "drop_path", 0.1)
         n_flow_groups = getattr(cfg, "n_flow_groups", 4)
+        proj_drop_rate = getattr(cfg, "proj_drop", 0.0)
+        head_drop_rate = getattr(cfg, "head_drop", 0.0)
 
         self.k_steps = k_steps
         num_patches = (img_size // patch_size) ** 2
@@ -360,11 +366,13 @@ class CSMamba_V6(nn.Module):
         self.layers = nn.ModuleList([
             CharacteristicMambaBlock_V6(
                 d_model=d_embed, drop_path=dp_rates[i], n_flow_groups=n_flow_groups,
+                proj_drop=proj_drop_rate,
             )
             for i in range(n_layers)
         ])
 
         self.final_norm = nn.LayerNorm(d_embed)
+        self.head_drop = nn.Dropout(head_drop_rate)
         self.head = nn.Linear(d_embed, n_classes)
 
         n_params = sum(p.numel() for p in self.parameters())
@@ -377,7 +385,7 @@ class CSMamba_V6(nn.Module):
         x = self.patch_embed(x).flatten(2).transpose(1, 2) + self.pos_embed
         for layer in self.layers:
             x = layer(x, k_steps=self.k_steps)
-        return self.head(self.final_norm(x).mean(dim=1))
+        return self.head(self.head_drop(self.final_norm(x).mean(dim=1)))
 
 
 __all__ = [

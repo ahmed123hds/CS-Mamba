@@ -51,7 +51,7 @@ from models.vmamba_4d import VMamba4D
 # ─────────────────────────────────────────────────────────
 def mixup_data(x, y, alpha=0.8):
     lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
-    index = torch.randperm(x.size(0))
+    index = torch.randperm(x.size(0), device=x.device)
     mixed_x = lam * x + (1 - lam) * x[index]
     return mixed_x, y, y[index], lam
 
@@ -59,14 +59,18 @@ def mixup_data(x, y, alpha=0.8):
 def cutmix_data(x, y, alpha=1.0):
     lam = np.random.beta(alpha, alpha)
     B, _, H, W = x.size()
-    index = torch.randperm(B)
+    index = torch.randperm(B, device=x.device)
     cut_rat = math.sqrt(1.0 - lam)
     cut_w, cut_h = int(W * cut_rat), int(H * cut_rat)
     cx, cy = random.randint(0, W), random.randint(0, H)
     x1, x2 = max(cx - cut_w // 2, 0), min(cx + cut_w // 2, W)
     y1, y2 = max(cy - cut_h // 2, 0), min(cy + cut_h // 2, H)
-    mixed_x = x.clone()
-    mixed_x[:, :, y1:y2, x1:x2] = x[index, :, y1:y2, x1:x2]
+    # Use a fixed-shape mask instead of dynamic slice assignment
+    # to avoid XLA recompilation from varying cut dimensions each step
+    row_mask = (torch.arange(H, device=x.device) >= y1) & (torch.arange(H, device=x.device) < y2)
+    col_mask = (torch.arange(W, device=x.device) >= x1) & (torch.arange(W, device=x.device) < x2)
+    mask = (row_mask[:, None] & col_mask[None, :]).unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+    mixed_x = torch.where(mask, x[index], x)
     lam = 1 - (x2 - x1) * (y2 - y1) / (W * H)
     return mixed_x, y, y[index], lam
 
@@ -114,6 +118,8 @@ def train_one_epoch(model, train_loader_raw, train_sampler, optimizer, criterion
     running_correct = torch.tensor(0, dtype=torch.long, device=device)
     running_total = torch.tensor(0, dtype=torch.long, device=device)
     debug_first_step = getattr(cfg, "debug_first_step", False)
+    use_mixup = getattr(cfg, "use_mixup", True)
+    grad_clip = getattr(cfg, "grad_clip", 1.0)
 
     for step, (imgs, labels) in enumerate(loader):
         if debug_first_step and step == 0:
@@ -125,12 +131,25 @@ def train_one_epoch(model, train_loader_raw, train_sampler, optimizer, criterion
             xm.master_print(f"    [debug] zero_grad done ({time.time() - dbg_t:.2f}s)")
             dbg_t = time.time()
 
+        # --- Mixup / CutMix regularization (50/50 random each step) ---
+        applied_mix = False
+        if use_mixup and model.training:
+            if random.random() < 0.5:
+                imgs, targets_a, targets_b, lam = mixup_data(imgs, labels, alpha=0.8)
+                applied_mix = True
+            else:
+                imgs, targets_a, targets_b, lam = cutmix_data(imgs, labels, alpha=1.0)
+                applied_mix = True
+
         outs = model(imgs)
         if debug_first_step and step == 0:
             xm.master_print(f"    [debug] forward returned ({time.time() - dbg_t:.2f}s)")
             dbg_t = time.time()
 
-        loss = criterion(outs, labels)
+        if applied_mix:
+            loss = mixup_criterion(criterion, outs, targets_a, targets_b, lam)
+        else:
+            loss = criterion(outs, labels)
         if debug_first_step and step == 0:
             xm.master_print(f"    [debug] loss built ({time.time() - dbg_t:.2f}s)")
             dbg_t = time.time()
@@ -139,6 +158,10 @@ def train_one_epoch(model, train_loader_raw, train_sampler, optimizer, criterion
         if debug_first_step and step == 0:
             xm.master_print(f"    [debug] backward returned ({time.time() - dbg_t:.2f}s)")
             dbg_t = time.time()
+
+        # Gradient clipping for training stability
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
         xm.optimizer_step(optimizer)
         if debug_first_step and step == 0:
@@ -310,6 +333,7 @@ def _mp_fn(index, flags):
 
     # ── Config ───────────────────────────────────────────
     setattr(flags, 'canvas_size', flags.img_size)
+    setattr(flags, 'use_mixup', not getattr(flags, 'no_mixup', False))
 
     results = {}
 
@@ -396,6 +420,14 @@ def parse_args():
         action='store_true',
         help="Print first-step phase timings to diagnose TPU compile stalls.",
     )
+    p.add_argument('--proj_drop',      type=float, default=0.1,
+                   help="Projection dropout rate inside SSM and block (default: 0.1)")
+    p.add_argument('--head_drop',      type=float, default=0.1,
+                   help="Dropout rate before classification head (default: 0.1)")
+    p.add_argument('--grad_clip',      type=float, default=1.0,
+                   help="Max gradient norm for clipping (0 to disable, default: 1.0)")
+    p.add_argument('--no_mixup',       action='store_true',
+                   help="Disable Mixup/CutMix regularization")
     return p.parse_args()
 
 
