@@ -19,6 +19,11 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+# Keep the TPU path on PyTorch/XLA only. Dynamo/Inductor can accidentally
+# spawn CPU compile workers and stall before the first XLA step.
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -108,13 +113,37 @@ def train_one_epoch(model, train_loader_raw, train_sampler, optimizer, criterion
     total_steps = len(train_loader_raw)
     running_correct = torch.tensor(0, dtype=torch.long, device=device)
     running_total = torch.tensor(0, dtype=torch.long, device=device)
+    debug_first_step = getattr(cfg, "debug_first_step", False)
 
     for step, (imgs, labels) in enumerate(loader):
+        if debug_first_step and step == 0:
+            dbg_t = time.time()
+            xm.master_print("    [debug] first batch received")
+
         optimizer.zero_grad()
+        if debug_first_step and step == 0:
+            xm.master_print(f"    [debug] zero_grad done ({time.time() - dbg_t:.2f}s)")
+            dbg_t = time.time()
+
         outs = model(imgs)
+        if debug_first_step and step == 0:
+            xm.master_print(f"    [debug] forward returned ({time.time() - dbg_t:.2f}s)")
+            dbg_t = time.time()
+
         loss = criterion(outs, labels)
+        if debug_first_step and step == 0:
+            xm.master_print(f"    [debug] loss built ({time.time() - dbg_t:.2f}s)")
+            dbg_t = time.time()
+
         loss.backward()
+        if debug_first_step and step == 0:
+            xm.master_print(f"    [debug] backward returned ({time.time() - dbg_t:.2f}s)")
+            dbg_t = time.time()
+
         xm.optimizer_step(optimizer)
+        if debug_first_step and step == 0:
+            xm.master_print(f"    [debug] optimizer_step returned ({time.time() - dbg_t:.2f}s)")
+
         tracker.add(cfg.batch_size)
 
         # Accumulate on-device (no .item() sync!)
@@ -204,7 +233,7 @@ def train_model(name, model, train_loader_raw, train_sampler, val_loader_raw, cf
             f"Time {t_ep:4.1f}s | LR {scheduler.get_last_lr()[0]:.2e}"
         )
 
-    xm.master_print(f"\n  \u2713 Best Val Acc: {best_acc:.2f}%\n")
+    xm.master_print(f"\n  ✓ Best Val Acc: {best_acc:.2f}%\n")
     return best_acc
 
 
@@ -362,6 +391,11 @@ def parse_args():
     p.add_argument('--weight_decay',   type=float, default=0.05)
     p.add_argument('--num_workers',    type=int,   default=4)
     p.add_argument('--seed',           type=int,   default=42)
+    p.add_argument(
+        '--debug_first_step',
+        action='store_true',
+        help="Print first-step phase timings to diagnose TPU compile stalls.",
+    )
     return p.parse_args()
 
 
