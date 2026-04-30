@@ -4,11 +4,11 @@ Characteristic Mamba V6 — Selective 2D Characteristic Transport
 Key ideas (from char_mamba_methodology.pdf):
   1. Learn a per-location transport direction via a stream function ψ
      whose curl gives a divergence-free velocity field.
-  2. Convert velocity to 4-neighbor routing weights via softmax.
-  3. Transport paired state (U, V) by weighted neighbor gathering.
+  2. Convert velocity + learned self score to 9-direction routing weights.
+  3. Transport paired state (U, V) by directional projected neighbor gathering.
   4. Optionally rotate the (U, V) pair by a learned phase angle Θ
      to retain V4's oscillatory channel coupling intuition.
-  5. Update state via selective Mamba-style retention/injection gates.
+  5. Update state via selective continuous-time retain/inject gating.
 
 All ops are real-valued, use only standard conv/gather/softmax,
 and are fully compatible with TPU/XLA BF16 execution.
@@ -53,10 +53,10 @@ class CharacteristicTransport2D(nn.Module):
 
     For T substeps, this module:
       1. Predicts a stream function ψ → derives divergence-free velocity (vx, vy)
-      2. Converts velocity to 4-neighbor routing weights
-      3. Transports paired state (U, V) via weighted neighbor gather
+      2. Converts velocity + learned self score to 9-direction routing weights
+      3. Transports paired state (U, V) via directional projected neighbor gather
       4. Applies optional phase rotation on (U, V) pairs
-      5. Updates state via selective retention (A) and injection (B) gates
+      5. Updates state via continuous-time decay-derived retain/inject gates
 
     All operations use real-valued tensors with standard ops (F.conv2d,
     F.pad, softmax) — no FFT, no complex dtype, fully XLA/TPU safe.
@@ -76,15 +76,23 @@ class CharacteristicTransport2D(nn.Module):
             nn.SiLU(),
             nn.Linear(d_inner, n_flow_groups, bias=True),
         )
+        self.self_route_head = nn.Linear(d_inner, n_flow_groups, bias=True)
+        nn.init.zeros_(self.self_route_head.weight)
+        nn.init.constant_(self.self_route_head.bias, 1.0)
+
+        # Direction-specific value scaling for self + 8 neighbors.
+        self.n_transport_dirs = 9
+        self.direction_value_scale = nn.Parameter(
+            torch.ones(1, d_inner, self.n_transport_dirs, 1, 1)
+        )
 
         # --- Phase rotation head (optional, per-channel angle Θ) ---
         self.phase_head = nn.Linear(d_inner, d_inner, bias=True)
         nn.init.zeros_(self.phase_head.weight)
         nn.init.zeros_(self.phase_head.bias)
 
-        # --- Selective gates ---
-        self.gate_a_head = nn.Linear(d_inner, d_inner, bias=True)  # retention
-        self.gate_b_head = nn.Linear(d_inner, d_inner, bias=True)  # injection
+        # --- Selective continuous-time decay gate ---
+        self.delta_head = nn.Linear(d_inner, d_inner, bias=True)
 
         # --- Injection features ---
         self.inj_proj = nn.Linear(d_inner, d_inner * 2, bias=False)
@@ -96,9 +104,9 @@ class CharacteristicTransport2D(nn.Module):
         self.out_proj = nn.Linear(d_inner * 2, d_inner, bias=False)
         self.D = nn.Parameter(torch.ones(d_inner))
 
-        # Init gates to be mildly retentive at start
-        nn.init.constant_(self.gate_a_head.bias, 1.5)   # sigmoid(1.5) ≈ 0.82
-        nn.init.constant_(self.gate_b_head.bias, -1.5)   # sigmoid(-1.5) ≈ 0.18
+        # Init gate to be mildly retentive at start:
+        # softplus(-1.5) ≈ 0.20, exp(-0.20) ≈ 0.82 retain / 0.18 inject.
+        nn.init.constant_(self.delta_head.bias, -1.5)
 
     @staticmethod
     def _stream_to_velocity(psi: torch.Tensor) -> tuple:
@@ -118,32 +126,47 @@ class CharacteristicTransport2D(nn.Module):
 
     @staticmethod
     def _velocity_to_routing(vx: torch.Tensor, vy: torch.Tensor,
+                              self_logits: torch.Tensor,
                               temperature: float = 1.0) -> torch.Tensor:
         """
-        Convert velocity (vx, vy) to 4-neighbor routing weights via softmax.
+        Convert velocity (vx, vy) to self + 8-neighbor routing weights.
 
-        Neighbors: up (-y), down (+y), left (-x), right (+x)
-        The dot product of velocity with each neighbor direction gives logits.
+        Neighbors: self, up, down, left, right, and four diagonals.
+        Neighbor logits come from velocity-direction dot products; the self
+        logit is learned directly because velocity alone cannot favor staying.
 
-        Returns: routing weights (B, G, 4, H, W) summing to 1 along dim=2.
+        Returns: routing weights (B, G, 9, H, W) summing to 1 along dim=2.
         """
-        # Neighbor direction vectors: (dy, dx)
-        # up=(-1,0), down=(+1,0), left=(0,-1), right=(0,+1)
-        logits_up    = -vx / temperature   # dot with (-1, 0)
-        logits_down  =  vx / temperature   # dot with (+1, 0)
-        logits_left  = -vy / temperature   # dot with (0, -1)
-        logits_right =  vy / temperature   # dot with (0, +1)
+        inv_sqrt2 = 1.0 / math.sqrt(2.0)
+        logits_self = self_logits
+        logits_up = -vx
+        logits_down = vx
+        logits_left = -vy
+        logits_right = vy
+        logits_up_left = (-vx - vy) * inv_sqrt2
+        logits_up_right = (-vx + vy) * inv_sqrt2
+        logits_down_left = (vx - vy) * inv_sqrt2
+        logits_down_right = (vx + vy) * inv_sqrt2
 
-        # Stack and softmax: (B, G, 4, H, W)
-        logits = torch.stack([logits_up, logits_down, logits_left, logits_right], dim=2)
+        logits = torch.stack([
+            logits_self,
+            logits_up,
+            logits_down,
+            logits_left,
+            logits_right,
+            logits_up_left,
+            logits_up_right,
+            logits_down_left,
+            logits_down_right,
+        ], dim=2) / temperature
         return F.softmax(logits, dim=2)
 
     def _transport(self, state: torch.Tensor, routing: torch.Tensor) -> torch.Tensor:
         """
-        Transport state using 4-neighbor weighted gather.
+        Transport state using self + 8-neighbor weighted gather.
 
         state: (B, D, H, W)
-        routing: (B, G, 4, H, W) — G groups, each controlling D//G channels
+        routing: (B, G, 9, H, W) — G groups, each controlling D//G channels
 
         Returns: transported state (B, D, H, W)
         """
@@ -153,18 +176,35 @@ class CharacteristicTransport2D(nn.Module):
 
         # Gather neighbors via constant padding
         # Circular padding translates into hundreds of slice+concat ops in XLA compiler.
+        s_self = state
         s_up    = F.pad(state, [0, 0, 1, 1], mode="constant", value=0.0)[:, :, :-2, :]
         s_down  = F.pad(state, [0, 0, 1, 1], mode="constant", value=0.0)[:, :, 2:,  :]
         s_left  = F.pad(state, [1, 1, 0, 0], mode="constant", value=0.0)[:, :, :, :-2]
         s_right = F.pad(state, [1, 1, 0, 0], mode="constant", value=0.0)[:, :, :, 2:]
+        s_pad = F.pad(state, [1, 1, 1, 1], mode="constant", value=0.0)
+        s_up_left = s_pad[:, :, :-2, :-2]
+        s_up_right = s_pad[:, :, :-2, 2:]
+        s_down_left = s_pad[:, :, 2:, :-2]
+        s_down_right = s_pad[:, :, 2:, 2:]
 
-        # Stack neighbors: (B, D, 4, H, W)
-        neighbors = torch.stack([s_up, s_down, s_left, s_right], dim=2)
+        # Stack neighbors: (B, D, 9, H, W)
+        neighbors = torch.stack([
+            s_self,
+            s_up,
+            s_down,
+            s_left,
+            s_right,
+            s_up_left,
+            s_up_right,
+            s_down_left,
+            s_down_right,
+        ], dim=2)
+        neighbors = neighbors * self.direction_value_scale
         
         # Reshape for broadcasting instead of repeat_interleave
-        # neighbors: (B, G, C, 4, H, W)
-        neighbors = neighbors.view(B, G, C, 4, H, W)
-        # routing: (B, G, 1, 4, H, W)
+        # neighbors: (B, G, C, 9, H, W)
+        neighbors = neighbors.reshape(B, G, C, 9, H, W)
+        # routing: (B, G, 1, 9, H, W)
         routing_bcast = routing.unsqueeze(2)
         
         # Weighted sum: (B, G, C, H, W) -> (B, D, H, W)
@@ -195,12 +235,14 @@ class CharacteristicTransport2D(nn.Module):
         # Stream function
         psi = self.stream_head(x)                                   # (B, N, G)
         psi = psi.permute(0, 2, 1).unflatten(2, (h, w))            # (B, G, H, W)
+        self_logits = self.self_route_head(x)
+        self_logits = self_logits.permute(0, 2, 1).unflatten(2, (h, w))
 
         # Velocity from curl of stream function
         vx, vy = self._stream_to_velocity(psi)
 
-        # Routing weights (4-neighbor softmax)
-        routing = self._velocity_to_routing(vx, vy)                 # (B, G, 4, H, W)
+        # Routing weights (self + 8-neighbor softmax)
+        routing = self._velocity_to_routing(vx, vy, self_logits)    # (B, G, 9, H, W)
 
         # Phase angle
         theta = self.phase_head(x)                                  # (B, N, D)
@@ -208,12 +250,10 @@ class CharacteristicTransport2D(nn.Module):
         cos_t = torch.cos(theta)
         sin_t = torch.sin(theta)
 
-        # Selective gates
-        gate_a = torch.sigmoid(self.gate_a_head(x))                 # (B, N, D)
-        gate_a = gate_a.permute(0, 2, 1).unflatten(2, (h, w))      # (B, D, H, W)
-
-        gate_b = torch.sigmoid(self.gate_b_head(x))
-        gate_b = gate_b.permute(0, 2, 1).unflatten(2, (h, w))
+        # Selective continuous-time decay gate
+        delta = F.softplus(self.delta_head(x))                      # (B, N, D)
+        retain = torch.exp(-delta).permute(0, 2, 1).unflatten(2, (h, w))
+        inject = 1.0 - retain
 
         # Injection features
         inj = self.inj_proj(x)                                      # (B, N, 2D)
@@ -232,8 +272,8 @@ class CharacteristicTransport2D(nn.Module):
             v_rot = sin_t * u_hat + cos_t * v_hat
 
             # 3. Selective recurrence: retain + inject
-            u = gate_a * u_rot + gate_b * xu
-            v = gate_a * v_rot + gate_b * xv
+            u = retain * u_rot + inject * xu
+            v = retain * v_rot + inject * xv
 
         # --- Project back to token space ---
         u_out = u.flatten(2).permute(0, 2, 1)                      # (B, N, D)
@@ -294,7 +334,7 @@ class CSMamba_V6(nn.Module):
     CS-Mamba V6 — Characteristic Mamba
     ====================================
     Selective 2D characteristic transport with learned divergence-free flow,
-    optional phase-rotation coupling, and Mamba-style retention/injection gates.
+    optional phase-rotation coupling, and continuous-time retain/inject gating.
     Linear complexity: O(T · N · D · |neighbors|).
     """
 
