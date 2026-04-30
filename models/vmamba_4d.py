@@ -2,8 +2,8 @@
 TPU-safe VMamba-style 4-direction Cross-Scan baseline.
 
 This is a lightweight benchmark model inspired by VMamba's SS2D idea:
-cross-scan a 2D feature map into four 1D routes, run a selective recurrent
-state update on each route, then cross-merge back to the image grid.
+scan a 2D feature map along left/right and top/bottom routes, run a selective
+recurrent state update on each route, then cross-merge back to the image grid.
 
 It intentionally avoids CUDA/Triton selective-scan kernels so it can run under
 PyTorch/XLA on TPU.
@@ -36,13 +36,18 @@ class DropPath(nn.Module):
 
 class CrossScanSS2D(nn.Module):
     """
-    Four-route selective scan over a square image-token grid.
+    Four-route axis-wise selective scan over a square image-token grid.
 
     Routes:
-      1. left-to-right / top-to-bottom
-      2. reverse of route 1
-      3. top-to-bottom / left-to-right over the transposed grid
-      4. reverse of route 3
+      1. left-to-right over each row
+      2. right-to-left over each row
+      3. top-to-bottom over each column
+      4. bottom-to-top over each column
+
+    The official VMamba-style flattened cross-scan traces length H*W sequences.
+    On TPU/XLA that creates a very large recurrent graph before step 0. This
+    axis-wise variant keeps the recurrent scan but reduces the traced length to
+    max(H, W), which is the TPU-safe 2D benchmark path.
     """
 
     def __init__(self, d_model: int, expand: int = 2):
@@ -87,23 +92,23 @@ class CrossScanSS2D(nn.Module):
 
         grid = x.transpose(1, 2).reshape(B, D, H, W)
 
-        route_hw = grid.flatten(2).transpose(1, 2)
-        route_hw_rev = torch.flip(route_hw, dims=[1])
-        route_wh = grid.transpose(2, 3).flatten(2).transpose(1, 2)
-        route_wh_rev = torch.flip(route_wh, dims=[1])
+        rows = grid.permute(0, 2, 3, 1).reshape(B * H, W, D)
+        cols = grid.permute(0, 3, 2, 1).reshape(B * W, H, D)
 
-        y_hw = self._selective_scan(route_hw, 0)
-        y_hw_rev = torch.flip(self._selective_scan(route_hw_rev, 1), dims=[1])
-        y_wh = self._selective_scan(route_wh, 2)
-        y_wh_rev = torch.flip(self._selective_scan(route_wh_rev, 3), dims=[1])
+        y_lr = self._selective_scan(rows, 0).reshape(B, H, W, D)
+        y_rl = torch.flip(
+            self._selective_scan(torch.flip(rows, dims=[1]), 1),
+            dims=[1],
+        ).reshape(B, H, W, D)
 
-        y_hw = y_hw.transpose(1, 2).reshape(B, D, H, W)
-        y_hw_rev = y_hw_rev.transpose(1, 2).reshape(B, D, H, W)
-        y_wh = y_wh.transpose(1, 2).reshape(B, D, W, H).transpose(2, 3)
-        y_wh_rev = y_wh_rev.transpose(1, 2).reshape(B, D, W, H).transpose(2, 3)
+        y_tb = self._selective_scan(cols, 2).reshape(B, W, H, D).permute(0, 2, 1, 3)
+        y_bt = torch.flip(
+            self._selective_scan(torch.flip(cols, dims=[1]), 3),
+            dims=[1],
+        ).reshape(B, W, H, D).permute(0, 2, 1, 3)
 
-        merged = (y_hw + y_hw_rev + y_wh + y_wh_rev) * 0.25
-        merged = merged.flatten(2).transpose(1, 2)
+        merged = (y_lr + y_rl + y_tb + y_bt) * 0.25
+        merged = merged.reshape(B, N, D)
         return self.out_norm(merged) + x * self.D
 
 
@@ -144,10 +149,10 @@ class VMamba4DBlock(nn.Module):
 
 class VMamba4D(nn.Module):
     """
-    TinyImageNet-friendly VMamba-style classifier.
+    TinyImageNet-friendly TPU-safe VMamba-style classifier.
 
     This keeps the same patch embedding / pooling style as CSMamba_V6 so the
-    benchmark mainly tests fixed 4-route scan transport versus learned 2D
+    benchmark mainly tests fixed 2D row/column scan transport versus learned
     characteristic transport.
     """
 
