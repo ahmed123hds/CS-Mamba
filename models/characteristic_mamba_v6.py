@@ -95,6 +95,11 @@ class CharacteristicTransport2D(nn.Module):
         # --- Selective continuous-time decay gate ---
         self.delta_head = nn.Linear(d_inner, d_inner, bias=True)
 
+        # Learn how much the evolving U state should perturb the routing
+        # features. Initialized at 0, so training starts from the stable
+        # input-conditioned routing and can grow state-dependent transport.
+        self.routing_state_mix = nn.Parameter(torch.zeros(d_inner))
+
         # --- Injection features ---
         self.inj_proj = nn.Linear(d_inner, d_inner * 2, bias=False)
 
@@ -250,16 +255,18 @@ class CharacteristicTransport2D(nn.Module):
         xu, xv = inj.chunk(2, dim=-1)
         xu = xu.permute(0, 2, 1).unflatten(2, (h, w))
         xv = xv.permute(0, 2, 1).unflatten(2, (h, w))
+        route_mix = torch.tanh(self.routing_state_mix).view(1, 1, d_inner)
 
         # --- Recurrent transport loop ---
         for _ in range(int(k_steps)):
-            # 0. Recompute routing from the evolving U state.
-            # This makes each characteristic substep state-dependent instead
-            # of repeatedly applying one frozen transport operator.
+            # 0. Recompute routing from input features plus a learnable
+            # residual contribution from the evolving U state. At init,
+            # route_mix=0, so this exactly matches the stable V6 routing.
             u_tokens = u.flatten(2).permute(0, 2, 1)
-            psi = self.stream_head(u_tokens)
+            route_tokens = x + route_mix * (u_tokens - x)
+            psi = self.stream_head(route_tokens)
             psi = psi.permute(0, 2, 1).unflatten(2, (h, w))
-            self_logits = self.self_route_head(u_tokens)
+            self_logits = self.self_route_head(route_tokens)
             self_logits = self_logits.permute(0, 2, 1).unflatten(2, (h, w))
             vx, vy = self._stream_to_velocity(psi)
             routing = self._velocity_to_routing(vx, vy, self_logits)
