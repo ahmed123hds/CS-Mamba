@@ -316,6 +316,7 @@ def _mp_fn(index, flags):
         # NOTE: RandomErasing removed — dynamic mask shapes cause XLA recompilation
     ])
     transform_val = transforms.Compose([
+        transforms.Resize((flags.img_size, flags.img_size)),
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
     ])
