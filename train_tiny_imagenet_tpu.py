@@ -29,6 +29,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, DistributedSampler
+import torchvision.datasets as datasets
 
 from datasets import load_dataset
 
@@ -218,7 +219,15 @@ def train_model(name, model, train_loader_raw, train_sampler, val_loader_raw, cf
     xm.master_print(f"\n{'='*60}")
     xm.master_print(f"  Training: {name}")
     xm.master_print(f"  Params:   {n_params:,}")
-    xm.master_print(f"  Dataset:  Tiny-ImageNet (200 classes, 100K images)")
+
+    if getattr(cfg, 'cfar100', False) or getattr(cfg, 'cifar100', False):
+        ds_name = "CIFAR-100 (100 classes, 50K images)"
+    elif getattr(cfg, 'cfar10', False) or getattr(cfg, 'cifar10', False):
+        ds_name = "CIFAR-10 (10 classes, 50K images)"
+    else:
+        ds_name = "Tiny-ImageNet (200 classes, 100K images)"
+
+    xm.master_print(f"  Dataset:  {ds_name}")
     xm.master_print(f"  Patches:  {(cfg.img_size//cfg.patch_size)**2} per image "
                     f"({cfg.img_size//cfg.patch_size}x{cfg.img_size//cfg.patch_size} grid)")
     xm.master_print(f"  World:    {xm.xrt_world_size()} TPU cores")
@@ -285,11 +294,17 @@ def _mp_fn(index, flags):
     xm.master_print(f"{'='*60}\n")
 
     # ── Dataset: each spawned process reads from HF cache independently ──
-    xm.master_print("  [Loading Tiny-ImageNet from HuggingFace cache...]")
-    ds = load_dataset("Maysee/tiny-imagenet")
-
-    mean = [0.485, 0.456, 0.406]
-    std  = [0.229, 0.224, 0.225]
+    if flags.cfar100 or flags.cifar100:
+        xm.master_print("  [Loading CIFAR-100...]")
+        mean, std = [0.5071, 0.4867, 0.4408], [0.2675, 0.2565, 0.2761]
+    elif flags.cfar10 or flags.cifar10:
+        xm.master_print("  [Loading CIFAR-10...]")
+        mean, std = [0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010]
+    else:
+        xm.master_print("  [Loading Tiny-ImageNet from HuggingFace cache...]")
+        ds = load_dataset("Maysee/tiny-imagenet")
+        mean = [0.485, 0.456, 0.406]
+        std  = [0.229, 0.224, 0.225]
 
     transform_train = transforms.Compose([
         transforms.RandomResizedCrop(flags.img_size, scale=(0.67, 1.0)),
@@ -305,8 +320,15 @@ def _mp_fn(index, flags):
         transforms.Normalize(mean, std),
     ])
 
-    train_ds = TinyImageNetDataset(ds['train'], transform_train)
-    val_ds   = TinyImageNetDataset(ds['valid'], transform_val)
+    if flags.cfar100 or flags.cifar100:
+        train_ds = datasets.CIFAR100(root='./data', train=True, transform=transform_train)
+        val_ds   = datasets.CIFAR100(root='./data', train=False, transform=transform_val)
+    elif flags.cfar10 or flags.cifar10:
+        train_ds = datasets.CIFAR10(root='./data', train=True, transform=transform_train)
+        val_ds   = datasets.CIFAR10(root='./data', train=False, transform=transform_val)
+    else:
+        train_ds = TinyImageNetDataset(ds['train'], transform_train)
+        val_ds   = TinyImageNetDataset(ds['valid'], transform_val)
 
     # ── Distributed Samplers for XLA ─────────────────────
     train_sampler = DistributedSampler(
@@ -437,6 +459,14 @@ def parse_args():
                    help="Max gradient norm for clipping (0 to disable, default: 1.0)")
     p.add_argument('--no_mixup',       action='store_true',
                    help="Disable Mixup/CutMix regularization")
+                   
+    # Dataset flags
+    p.add_argument('--cifar100',       action='store_true', help="Use CIFAR-100 dataset")
+    p.add_argument('--cfar100',        action='store_true', help="Alias for --cifar100")
+    p.add_argument('--cifar10',        action='store_true', help="Use CIFAR-10 dataset")
+    p.add_argument('--cfar10',         action='store_true', help="Alias for --cifar10")
+    p.add_argument('--tinyimagenet',   action='store_true', help="Use Tiny-ImageNet (default)")
+    
     return p.parse_args()
 
 
@@ -444,9 +474,22 @@ if __name__ == '__main__':
     flags = parse_args()
 
     # Pre-download dataset in main process so all spawned workers hit the local cache
-    print("[Main] Pre-fetching Tiny-ImageNet to local HuggingFace cache...")
-    load_dataset("Maysee/tiny-imagenet")
-    print("[Main] Dataset cached. Spawning TPU workers with start_method='spawn'...")
+    if flags.cfar100 or flags.cifar100:
+        print("[Main] Pre-fetching CIFAR-100...")
+        datasets.CIFAR100(root='./data', train=True, download=True)
+        datasets.CIFAR100(root='./data', train=False, download=True)
+        flags.n_classes = 100
+    elif flags.cfar10 or flags.cifar10:
+        print("[Main] Pre-fetching CIFAR-10...")
+        datasets.CIFAR10(root='./data', train=True, download=True)
+        datasets.CIFAR10(root='./data', train=False, download=True)
+        flags.n_classes = 10
+    else:
+        print("[Main] Pre-fetching Tiny-ImageNet to local HuggingFace cache...")
+        load_dataset("Maysee/tiny-imagenet")
+        flags.n_classes = 200
+
+    print("[Main] Dataset cached. Spawning TPU workers with start_method='fork'...")
 
     # Use 'fork' — inherits parent's /dev/accel0 TPU device permissions
     # Original fork issues (deadlock, slow training) were caused by:
