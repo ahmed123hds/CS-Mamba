@@ -93,13 +93,13 @@ class CharacteristicTransport2D(nn.Module):
         nn.init.zeros_(self.phase_head.bias)
 
         # --- Selective continuous-time decay gate (NEW) ---
-        # [ABLATION] Commented out new gating
-        # self.delta_head = nn.Linear(d_inner, d_inner, bias=True)
+        self.delta_head = nn.Linear(d_inner, d_inner, bias=True)
         # self.routing_state_mix = nn.Parameter(torch.zeros(d_inner))
 
         # --- Old Gating (Sigmoid) ---
-        self.gate_a_head = nn.Linear(d_inner, d_inner, bias=True)
-        self.gate_b_head = nn.Linear(d_inner, d_inner, bias=True)
+        # [ABLATION] Commented out old sigmoid gating
+        # self.gate_a_head = nn.Linear(d_inner, d_inner, bias=True)
+        # self.gate_b_head = nn.Linear(d_inner, d_inner, bias=True)
 
         # --- Injection features ---
         self.inj_proj = nn.Linear(d_inner, d_inner * 2, bias=False)
@@ -114,8 +114,7 @@ class CharacteristicTransport2D(nn.Module):
 
         # Init gate to be mildly retentive at start:
         # softplus(-1.5) ≈ 0.20, exp(-0.20) ≈ 0.82 retain / 0.18 inject.
-        # [ABLATION] Commented out new init
-        # nn.init.constant_(self.delta_head.bias, -1.5)
+        nn.init.constant_(self.delta_head.bias, -1.5)
 
     @staticmethod
     def _stream_to_velocity(psi: torch.Tensor) -> tuple:
@@ -261,12 +260,10 @@ class CharacteristicTransport2D(nn.Module):
         cos_t = torch.cos(theta)
         sin_t = torch.sin(theta)
 
-        # Gates computed ONCE (Sigmoid instead of exp(-delta))
-        gate_a = torch.sigmoid(self.gate_a_head(x))                # retain
-        gate_a = gate_a.permute(0, 2, 1).unflatten(2, (h, w))
-
-        gate_b = torch.sigmoid(self.gate_b_head(x))                # inject
-        gate_b = gate_b.permute(0, 2, 1).unflatten(2, (h, w))
+        # Gates computed ONCE (Zero-Order Hold discretization)
+        delta = F.softplus(self.delta_head(x))                      # (B, N, D)
+        retain = torch.exp(-delta).permute(0, 2, 1).unflatten(2, (h, w))
+        inject = 1.0 - retain
 
         # Injection features computed ONCE
         inj = self.inj_proj(x)                                     # (B, N, 2D)
@@ -285,8 +282,8 @@ class CharacteristicTransport2D(nn.Module):
             v_rot = sin_t * u_hat + cos_t * v_hat
 
             # Same gates/injection every step
-            u = gate_a * u_rot + gate_b * xu
-            v = gate_a * v_rot + gate_b * xv
+            u = retain * u_rot + inject * xu
+            v = retain * v_rot + inject * xv
 
         # --- Project back to token space ---
         u_out = u.flatten(2).permute(0, 2, 1)                      # (B, N, D)
