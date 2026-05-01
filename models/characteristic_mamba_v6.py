@@ -92,13 +92,14 @@ class CharacteristicTransport2D(nn.Module):
         nn.init.zeros_(self.phase_head.weight)
         nn.init.zeros_(self.phase_head.bias)
 
-        # --- Selective continuous-time decay gate ---
-        self.delta_head = nn.Linear(d_inner, d_inner, bias=True)
+        # --- Selective continuous-time decay gate (NEW) ---
+        # [ABLATION] Commented out new gating
+        # self.delta_head = nn.Linear(d_inner, d_inner, bias=True)
+        # self.routing_state_mix = nn.Parameter(torch.zeros(d_inner))
 
-        # Learn how much the evolving U state should perturb the routing
-        # features. Initialized at 0, so training starts from the stable
-        # input-conditioned routing and can grow state-dependent transport.
-        self.routing_state_mix = nn.Parameter(torch.zeros(d_inner))
+        # --- Old Gating (Sigmoid) ---
+        self.gate_a_head = nn.Linear(d_inner, d_inner, bias=True)
+        self.gate_b_head = nn.Linear(d_inner, d_inner, bias=True)
 
         # --- Injection features ---
         self.inj_proj = nn.Linear(d_inner, d_inner * 2, bias=False)
@@ -113,7 +114,8 @@ class CharacteristicTransport2D(nn.Module):
 
         # Init gate to be mildly retentive at start:
         # softplus(-1.5) ≈ 0.20, exp(-0.20) ≈ 0.82 retain / 0.18 inject.
-        nn.init.constant_(self.delta_head.bias, -1.5)
+        # [ABLATION] Commented out new init
+        # nn.init.constant_(self.delta_head.bias, -1.5)
 
     @staticmethod
     def _stream_to_velocity(psi: torch.Tensor) -> tuple:
@@ -238,50 +240,53 @@ class CharacteristicTransport2D(nn.Module):
         u = u.permute(0, 2, 1).unflatten(2, (h, w))                # (B, D, H, W)
         v = v.permute(0, 2, 1).unflatten(2, (h, w))
 
-        # --- Input-conditioned terms that stay fixed across substeps ---
-        # Phase angle
-        theta = self.phase_head(x)                                  # (B, N, D)
+        # --- Precompute conditioning once ---
+
+        # Stream function
+        psi = self.stream_head(x)                                  # (B, N, G)
+        psi = psi.permute(0, 2, 1).unflatten(2, (h, w))            # (B, G, H, W)
+        
+        self_logits = self.self_route_head(x)
+        self_logits = self_logits.permute(0, 2, 1).unflatten(2, (h, w))
+
+        # Velocity from curl of stream function
+        vx, vy = self._stream_to_velocity(psi)
+
+        # Routing weights computed ONCE
+        routing = self._velocity_to_routing(vx, vy, self_logits)
+
+        # Phase angle computed ONCE
+        theta = self.phase_head(x)                                 # (B, N, D)
         theta = theta.permute(0, 2, 1).unflatten(2, (h, w))        # (B, D, H, W)
         cos_t = torch.cos(theta)
         sin_t = torch.sin(theta)
 
-        # Selective continuous-time decay gate
-        delta = F.softplus(self.delta_head(x))                      # (B, N, D)
-        retain = torch.exp(-delta).permute(0, 2, 1).unflatten(2, (h, w))
-        inject = 1.0 - retain
+        # Gates computed ONCE (Sigmoid instead of exp(-delta))
+        gate_a = torch.sigmoid(self.gate_a_head(x))                # retain
+        gate_a = gate_a.permute(0, 2, 1).unflatten(2, (h, w))
 
-        # Injection features
-        inj = self.inj_proj(x)                                      # (B, N, 2D)
+        gate_b = torch.sigmoid(self.gate_b_head(x))                # inject
+        gate_b = gate_b.permute(0, 2, 1).unflatten(2, (h, w))
+
+        # Injection features computed ONCE
+        inj = self.inj_proj(x)                                     # (B, N, 2D)
         xu, xv = inj.chunk(2, dim=-1)
         xu = xu.permute(0, 2, 1).unflatten(2, (h, w))
         xv = xv.permute(0, 2, 1).unflatten(2, (h, w))
-        route_mix = torch.tanh(self.routing_state_mix).view(1, 1, d_inner)
 
         # --- Recurrent transport loop ---
         for _ in range(int(k_steps)):
-            # 0. Recompute routing from input features plus a learnable
-            # residual contribution from the evolving U state. At init,
-            # route_mix=0, so this exactly matches the stable V6 routing.
-            u_tokens = u.flatten(2).permute(0, 2, 1)
-            route_tokens = x + route_mix * (u_tokens - x)
-            psi = self.stream_head(route_tokens)
-            psi = psi.permute(0, 2, 1).unflatten(2, (h, w))
-            self_logits = self.self_route_head(route_tokens)
-            self_logits = self_logits.permute(0, 2, 1).unflatten(2, (h, w))
-            vx, vy = self._stream_to_velocity(psi)
-            routing = self._velocity_to_routing(vx, vy, self_logits)
-
-            # 1. Transport state along learned flow
+            # Same routing every step
             u_hat = self._transport(u, routing)
             v_hat = self._transport(v, routing)
 
-            # 2. Phase rotation (optional oscillatory channel coupling)
+            # Same rotation every step
             u_rot = cos_t * u_hat - sin_t * v_hat
             v_rot = sin_t * u_hat + cos_t * v_hat
 
-            # 3. Selective recurrence: retain + inject
-            u = retain * u_rot + inject * xu
-            v = retain * v_rot + inject * xv
+            # Same gates/injection every step
+            u = gate_a * u_rot + gate_b * xu
+            v = gate_a * v_rot + gate_b * xv
 
         # --- Project back to token space ---
         u_out = u.flatten(2).permute(0, 2, 1)                      # (B, N, D)
