@@ -276,8 +276,10 @@ class CharacteristicTransport2D(nn.Module):
             v_hat = self._transport(v, routing)
 
             # 2. Phase rotation (optional oscillatory channel coupling)
-            u_rot = cos_t * u_hat - sin_t * v_hat
-            v_rot = sin_t * u_hat + cos_t * v_hat
+            # [ABLATION]: Rotation commented out
+            # u_rot = cos_t * u_hat - sin_t * v_hat
+            # v_rot = sin_t * u_hat + cos_t * v_hat
+            u_rot, v_rot = u_hat, v_hat
 
             # 3. Selective recurrence: retain + inject
             u = retain * u_rot + inject * xu
