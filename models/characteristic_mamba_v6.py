@@ -276,10 +276,8 @@ class CharacteristicTransport2D(nn.Module):
             v_hat = self._transport(v, routing)
 
             # 2. Phase rotation (optional oscillatory channel coupling)
-            # [ABLATION]: Rotation commented out
-            # u_rot = cos_t * u_hat - sin_t * v_hat
-            # v_rot = sin_t * u_hat + cos_t * v_hat
-            u_rot, v_rot = u_hat, v_hat
+            u_rot = cos_t * u_hat - sin_t * v_hat
+            v_rot = sin_t * u_hat + cos_t * v_hat
 
             # 3. Selective recurrence: retain + inject
             u = retain * u_rot + inject * xu
@@ -306,7 +304,7 @@ class CharacteristicMambaBlock_V6(nn.Module):
         d_inner = int(expand * d_model)
         self.norm = nn.LayerNorm(d_model)
         self.in_proj = nn.Linear(d_model, d_inner * 2, bias=False)
-        self.local_conv2d = nn.Conv2d(
+        self.local_conv1d = nn.Conv1d(
             d_inner, d_inner, kernel_size=3, padding=1, groups=d_inner, bias=True,
         )
         self.activation = nn.SiLU()
@@ -326,10 +324,10 @@ class CharacteristicMambaBlock_V6(nn.Module):
         xz = self.in_proj(self.norm(x))
         u, z = xz.chunk(2, dim=-1)
 
-        # Local preprocessing: (B, N, D) → (B, D, H, W) → conv → back
-        u_2d = u.permute(0, 2, 1).unflatten(2, (h, w))
-        u_2d = self.local_conv2d(u_2d)
-        u = u_2d.flatten(2).permute(0, 2, 1)
+        # Local preprocessing: (B, N, D) → (B, D, N) → 1D conv → back
+        u_1d = u.permute(0, 2, 1)
+        u_1d = self.local_conv1d(u_1d)
+        u = u_1d.permute(0, 2, 1)
         u = self.activation(u)
 
         y_ssm = self.ssm(u, k_steps=k_steps)
