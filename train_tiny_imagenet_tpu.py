@@ -102,10 +102,11 @@ class MixupCutMixCollate:
         imgs, labels = zip(*batch)
         imgs   = torch.stack(imgs)                             # (B, C, H, W)
         labels = torch.tensor(labels, dtype=torch.long)        # (B,)
-        if random.random() < self.p_cutmix:
-            return self._cutmix(imgs, labels)
-        else:
-            return self._mixup(imgs, labels)
+        # [ABLATION] Commented out CutMix branch, only use Mixup
+        # if random.random() < self.p_cutmix:
+        #     return self._cutmix(imgs, labels)
+        # else:
+        return self._mixup(imgs, labels)
 
 
 # ─────────────────────────────────────────────────────────
