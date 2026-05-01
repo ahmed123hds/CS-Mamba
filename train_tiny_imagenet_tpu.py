@@ -321,11 +321,11 @@ def _mp_fn(index, flags):
     ])
 
     if flags.cfar100 or flags.cifar100:
-        train_ds = datasets.CIFAR100(root='./data', train=True, transform=transform_train)
-        val_ds   = datasets.CIFAR100(root='./data', train=False, transform=transform_val)
+        train_ds = datasets.CIFAR100(root='./torch_data', train=True, transform=transform_train)
+        val_ds   = datasets.CIFAR100(root='./torch_data', train=False, transform=transform_val)
     elif flags.cfar10 or flags.cifar10:
-        train_ds = datasets.CIFAR10(root='./data', train=True, transform=transform_train)
-        val_ds   = datasets.CIFAR10(root='./data', train=False, transform=transform_val)
+        train_ds = datasets.CIFAR10(root='./torch_data', train=True, transform=transform_train)
+        val_ds   = datasets.CIFAR10(root='./torch_data', train=False, transform=transform_val)
     else:
         train_ds = TinyImageNetDataset(ds['train'], transform_train)
         val_ds   = TinyImageNetDataset(ds['valid'], transform_val)
@@ -476,13 +476,13 @@ if __name__ == '__main__':
     # Pre-download dataset in main process so all spawned workers hit the local cache
     if flags.cfar100 or flags.cifar100:
         print("[Main] Pre-fetching CIFAR-100...")
-        datasets.CIFAR100(root='./data', train=True, download=True)
-        datasets.CIFAR100(root='./data', train=False, download=True)
+        datasets.CIFAR100(root='./torch_data', train=True, download=True)
+        datasets.CIFAR100(root='./torch_data', train=False, download=True)
         flags.n_classes = 100
     elif flags.cfar10 or flags.cifar10:
         print("[Main] Pre-fetching CIFAR-10...")
-        datasets.CIFAR10(root='./data', train=True, download=True)
-        datasets.CIFAR10(root='./data', train=False, download=True)
+        datasets.CIFAR10(root='./torch_data', train=True, download=True)
+        datasets.CIFAR10(root='./torch_data', train=False, download=True)
         flags.n_classes = 10
     else:
         print("[Main] Pre-fetching Tiny-ImageNet to local HuggingFace cache...")
