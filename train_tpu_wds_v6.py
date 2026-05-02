@@ -46,6 +46,7 @@ import webdataset as wds
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
+import torch_xla.runtime as xr
 
 from models.characteristic_mamba_v6 import CSMamba_V6
 
@@ -187,7 +188,7 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
         return images, labels
 
     dataset = (
-        wds.WebDataset(shards_url, resampled=True, nodesplitter=None)
+        wds.WebDataset(shards_url, resampled=True, nodesplitter=None, shardshuffle=True)
         .shuffle(5000 if is_training else 0)
         .decode("pil")
         .to_tuple("jpg;png", "cls")
@@ -256,7 +257,7 @@ def build_tiny_loader(flags, is_training=True):
     dataset = TinyImageNetDataset(ds["train"] if is_training else ds["valid"], transform)
     sampler = DistributedSampler(
         dataset,
-        num_replicas=xm.xrt_world_size(),
+        num_replicas=xr.world_size(),
         rank=xm.get_ordinal(),
         shuffle=is_training,
     )
@@ -295,12 +296,11 @@ def _mp_fn(index, flags):
     cfg.K_steps = flags.K_steps
     cfg.n_classes = flags.n_classes
     cfg.canvas_size = flags.img_size
-    cfg.drop_path = flags.drop_path
     cfg.n_flow_groups = flags.n_flow_groups
 
     model = CSMamba_V6(cfg).to(device)
 
-    world_size = xm.xrt_world_size()
+    world_size = xr.world_size()
     global_bs = flags.batch_size * world_size
     scaled_lr = flags.base_lr * (global_bs / 1024.0)
 
