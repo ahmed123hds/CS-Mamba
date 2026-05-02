@@ -217,8 +217,10 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
     return wds.WebLoader(
         dataset,
         batch_size=None,
-        num_workers=0,
+        num_workers=flags.num_workers,
         pin_memory=True,
+        prefetch_factor=2 if flags.num_workers > 0 else None,
+        persistent_workers=flags.num_workers > 0,
     )
 
 
@@ -364,44 +366,8 @@ def _mp_fn(index, flags):
     xm.master_print(f"Scaled LR: {scaled_lr:.6f} | AMP BF16: {flags.amp_bf16} | Flow Groups: {flags.n_flow_groups}")
     xm.master_print(f"{'='*72}\n")
 
-    # ----------------------------------------------------------------
-    # SMOKE TESTS: Run before training to pinpoint where hangs occur
-    # ----------------------------------------------------------------
-    if xm.is_master_ordinal():
-        print(f"[SMOKE] Testing data pipeline (fetching 1 raw batch from GCS)...", flush=True)
-        try:
-            raw_iter = iter(train_loader)
-            smoke_batch = next(raw_iter)
-            print(f"[SMOKE] DATA OK: got batch of {len(smoke_batch)} elements, first shape={smoke_batch[0].shape}", flush=True)
-            del raw_iter, smoke_batch
-        except Exception as e:
-            print(f"[SMOKE] DATA FAILED: {e}", flush=True)
-
-    xm.rendezvous("smoke_data_done")
-
-    if xm.is_master_ordinal():
-        print(f"[SMOKE] Testing model forward pass (on CPU, no TPU)...", flush=True)
-        try:
-            dummy = torch.randn(2, 3, flags.img_size, flags.img_size)
-            with torch.no_grad():
-                dummy_out = model.cpu()(dummy)
-            model.to(device)
-            print(f"[SMOKE] MODEL OK: output shape={dummy_out.shape}", flush=True)
-        except Exception as e:
-            print(f"[SMOKE] MODEL FAILED: {e}", flush=True)
-            model.to(device)
-
-    xm.rendezvous("smoke_model_done")
-    xm.master_print("[SMOKE] All smoke tests passed. Starting training loop...")
-
-    # For WebDataset: iterate directly (MpDeviceLoader hangs with WebLoader)
-    # For TinyImageNet: use MpDeviceLoader (works with standard DataLoader)
-    if not is_imagenet:
-        para_train = pl.MpDeviceLoader(train_loader, device)
-        para_val = pl.MpDeviceLoader(val_loader, device)
-    else:
-        para_train = train_loader
-        para_val = val_loader
+    para_train = pl.MpDeviceLoader(train_loader, device)
+    para_val = pl.MpDeviceLoader(val_loader, device)
 
     for epoch in range(start_epoch, flags.epochs + 1):
         if not is_imagenet:
@@ -422,11 +388,6 @@ def _mp_fn(index, flags):
             if step >= train_steps:
                 break
             images, labels_a, labels_b, lam = batch
-            if is_imagenet:
-                images = images.to(device)
-                labels_a = labels_a.to(device)
-                labels_b = labels_b.to(device)
-                lam = lam.to(device)
             if step == 0:
                 xm.master_print(f"    [DEBUG] Step 0: images shape={images.shape}, dtype={images.dtype}")
             optimizer.zero_grad(set_to_none=True)
@@ -478,9 +439,6 @@ def _mp_fn(index, flags):
             if step >= val_steps:
                 break
             images, labels = batch
-            if is_imagenet:
-                images = images.to(device)
-                labels = labels.to(device)
             with torch.no_grad():
                 with _autocast_ctx(flags):
                     logits = model(images)
