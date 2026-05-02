@@ -165,9 +165,9 @@ def train_one_epoch(model, train_loader_raw, train_sampler, optimizer, criterion
 
         loss.backward()
 
-        # Gradient clipping for training stability
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # [ABLATION] Commented out gradient clipping
+        # if grad_clip > 0:
+        #     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
         xm.optimizer_step(optimizer)
         if debug_first_step and step == 0:
