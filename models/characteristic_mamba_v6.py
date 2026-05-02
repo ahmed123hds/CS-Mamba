@@ -211,15 +211,17 @@ class CharacteristicTransport2D(nn.Module):
         # neighbors: (B, G, C, 9, H, W)
         neighbors = neighbors.reshape(B, G, C, 9, H, W)
         
-        # Apply direction value scale after reshape to avoid XLA HLO fusion bug
+        # [XLA BUG FIX]: Multiply scale with routing FIRST, instead of multiplying scale with neighbors.
+        # This prevents the XLA compiler from trying to push the parameter multiplication through 
+        # the complex Pad->Slice->Stack view chain (which causes the hlo_instruction.cc SIGABRT).
         scale = self.direction_value_scale.reshape(1, G, C, 9, 1, 1)
-        neighbors = neighbors * scale
+        routing_bcast = routing.unsqueeze(2) # (B, G, 1, 9, H, W)
         
-        # routing: (B, G, 1, 9, H, W)
-        routing_bcast = routing.unsqueeze(2)
+        # Combined weight: (B, G, C, 9, H, W)
+        combined_weight = routing_bcast * scale
         
         # Weighted sum: (B, G, C, H, W) -> (B, D, H, W)
-        transported = (neighbors * routing_bcast).sum(dim=3).view(B, D, H, W)
+        transported = (neighbors * combined_weight).sum(dim=3).view(B, D, H, W)
         return transported
 
     def forward(self, x: torch.Tensor, k_steps: int = 4) -> torch.Tensor:
