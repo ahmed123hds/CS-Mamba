@@ -164,9 +164,9 @@ def train_one_epoch(model, train_loader_raw, train_sampler, optimizer, criterion
 
         loss.backward()
 
-        # Gradient clipping for training stability
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # [ABLATION] Commented out gradient clipping
+        # if grad_clip > 0:
+        #     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
         xm.optimizer_step(optimizer)
         if debug_first_step and step == 0:
@@ -344,8 +344,9 @@ def _mp_fn(index, flags):
         shuffle=False
     )
 
-    # [ABLATION] Mixup restored (CutMix remains disabled in collate)
-    use_mixup = not getattr(flags, 'no_mixup', False)
+    # [ABLATION] Commented out Mixup/CutMix entirely
+    # use_mixup = not getattr(flags, 'no_mixup', False)
+    use_mixup = False
     mixup_collate = MixupCutMixCollate(n_classes=flags.n_classes) if use_mixup else None
 
     train_loader_raw = DataLoader(
