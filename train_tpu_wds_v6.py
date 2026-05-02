@@ -364,9 +364,41 @@ def _mp_fn(index, flags):
     xm.master_print(f"Scaled LR: {scaled_lr:.6f} | AMP BF16: {flags.amp_bf16} | Flow Groups: {flags.n_flow_groups}")
     xm.master_print(f"{'='*72}\n")
 
+    # ----------------------------------------------------------------
+    # SMOKE TESTS: Run before training to pinpoint where hangs occur
+    # ----------------------------------------------------------------
+    if xm.is_master_ordinal():
+        print(f"[SMOKE] Testing data pipeline (fetching 1 raw batch from GCS)...", flush=True)
+        try:
+            raw_iter = iter(train_loader)
+            smoke_batch = next(raw_iter)
+            print(f"[SMOKE] DATA OK: got batch of {len(smoke_batch)} elements, first shape={smoke_batch[0].shape}", flush=True)
+            del raw_iter, smoke_batch
+        except Exception as e:
+            print(f"[SMOKE] DATA FAILED: {e}", flush=True)
+
+    xm.rendezvous("smoke_data_done")
+
+    if xm.is_master_ordinal():
+        print(f"[SMOKE] Testing model forward pass (on CPU, no TPU)...", flush=True)
+        try:
+            import torch
+            dummy = torch.randn(2, 3, flags.img_size, flags.img_size)
+            with torch.no_grad():
+                dummy_out = model.cpu()(dummy)
+            model.to(device)
+            print(f"[SMOKE] MODEL OK: output shape={dummy_out.shape}", flush=True)
+        except Exception as e:
+            print(f"[SMOKE] MODEL FAILED: {e}", flush=True)
+            model.to(device)
+
+    xm.rendezvous("smoke_model_done")
+    xm.master_print("[SMOKE] All smoke tests passed. Building MpDeviceLoader...")
+
     # Build device loaders ONCE outside the epoch loop
     para_train = pl.MpDeviceLoader(train_loader, device)
     para_val = pl.MpDeviceLoader(val_loader, device)
+    xm.master_print("[SMOKE] MpDeviceLoader built. Starting training loop...")
 
     for epoch in range(start_epoch, flags.epochs + 1):
         if not is_imagenet:
@@ -377,21 +409,41 @@ def _mp_fn(index, flags):
         total_loss, total_correct, total = 0.0, 0.0, 0
         t0 = time.time()
         
-        xm.master_print(f"=== Starting Epoch {epoch}. First step will take 5-10 minutes for XLA Compilation! ===")
+        xm.master_print(f"=== Starting Epoch {epoch}. Waiting for first batch from GCS... ===")
+        xm.master_print(f"    [DEBUG] If stuck here: GCS streaming is slow/blocked.")
+        xm.master_print(f"    [DEBUG] If progress: XLA graph is compiling (wait 3-5 min).")
 
         for step, batch in enumerate(para_train):
+            if step == 0:
+                xm.master_print(f"    [DEBUG] Step 0: GOT FIRST BATCH. Starting XLA trace/compile...")
             if step >= train_steps:
                 break
             images, labels_a, labels_b, lam = batch
+            if step == 0:
+                xm.master_print(f"    [DEBUG] Step 0: images shape={images.shape}, dtype={images.dtype}")
             optimizer.zero_grad(set_to_none=True)
             with _autocast_ctx(flags):
+                if step == 0:
+                    xm.master_print(f"    [DEBUG] Step 0: Running forward pass...")
                 logits = model(images)
+                if step == 0:
+                    xm.master_print(f"    [DEBUG] Step 0: Forward done. logits shape={logits.shape}. Computing loss...")
                 loss = mixup_criterion(criterion, logits, labels_a, labels_b, lam)
+            if step == 0:
+                xm.master_print(f"    [DEBUG] Step 0: Loss computed. Running backward...")
             loss.backward()
+            if step == 0:
+                xm.master_print(f"    [DEBUG] Step 0: Backward done. Reducing gradients...")
             xm.reduce_gradients(optimizer)
             # [ABLATION] Commented out gradient clipping
             # torch.nn.utils.clip_grad_norm_(model.parameters(), flags.grad_clip)
+            if step == 0:
+                xm.master_print(f"    [DEBUG] Step 0: Stepping optimizer...")
             xm.optimizer_step(optimizer)
+            if step == 0:
+                xm.master_print(f"    [DEBUG] Step 0: Materializing tensors (xm.mark_step)...")
+                xm.mark_step()
+                xm.master_print(f"    [DEBUG] Step 0: COMPLETE! XLA compilation done. Training is running!")
             tracker.add(flags.batch_size)
 
             total_loss += loss.item() * images.size(0)
