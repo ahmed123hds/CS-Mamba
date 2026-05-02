@@ -151,6 +151,18 @@ def build_lr_scheduler(optimizer, flags, scaled_lr):
 
 
 def build_wds_loader(shards_url, batch_size, flags, is_training=True):
+    import torch_xla.core.xla_model as xm
+    try:
+        global_rank = xm.get_ordinal()
+        global_world_size = xm.xrt_world_size()
+    except Exception:
+        global_rank = 0
+        global_world_size = 1
+
+    def safe_xla_nodesplitter(urls):
+        urls = list(urls)
+        return urls[global_rank::global_world_size]
+
     if is_training:
         transform = T.Compose([
             T.RandomResizedCrop(flags.img_size, scale=(0.08, 1.0), interpolation=T.InterpolationMode.BICUBIC),
@@ -188,7 +200,13 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
         return images, labels
 
     dataset = (
-        wds.WebDataset(shards_url, resampled=True, nodesplitter=None, shardshuffle=True)
+        wds.WebDataset(
+            shards_url, 
+            resampled=is_training, 
+            nodesplitter=safe_xla_nodesplitter, 
+            shardshuffle=1000 if is_training else False,
+            empty_check=False,
+        )
         .shuffle(5000 if is_training else 0)
         .decode("pil")
         .to_tuple("jpg;png", "cls")
