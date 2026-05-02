@@ -392,12 +392,16 @@ def _mp_fn(index, flags):
             model.to(device)
 
     xm.rendezvous("smoke_model_done")
-    xm.master_print("[SMOKE] All smoke tests passed. Building MpDeviceLoader...")
+    xm.master_print("[SMOKE] All smoke tests passed. Starting training loop...")
 
-    # Build device loaders ONCE outside the epoch loop
-    para_train = pl.MpDeviceLoader(train_loader, device)
-    para_val = pl.MpDeviceLoader(val_loader, device)
-    xm.master_print("[SMOKE] MpDeviceLoader built. Starting training loop...")
+    # For WebDataset: iterate directly (MpDeviceLoader hangs with WebLoader)
+    # For TinyImageNet: use MpDeviceLoader (works with standard DataLoader)
+    if not is_imagenet:
+        para_train = pl.MpDeviceLoader(train_loader, device)
+        para_val = pl.MpDeviceLoader(val_loader, device)
+    else:
+        para_train = train_loader
+        para_val = val_loader
 
     for epoch in range(start_epoch, flags.epochs + 1):
         if not is_imagenet:
@@ -418,6 +422,11 @@ def _mp_fn(index, flags):
             if step >= train_steps:
                 break
             images, labels_a, labels_b, lam = batch
+            if is_imagenet:
+                images = images.to(device)
+                labels_a = labels_a.to(device)
+                labels_b = labels_b.to(device)
+                lam = lam.to(device)
             if step == 0:
                 xm.master_print(f"    [DEBUG] Step 0: images shape={images.shape}, dtype={images.dtype}")
             optimizer.zero_grad(set_to_none=True)
@@ -469,6 +478,9 @@ def _mp_fn(index, flags):
             if step >= val_steps:
                 break
             images, labels = batch
+            if is_imagenet:
+                images = images.to(device)
+                labels = labels.to(device)
             with torch.no_grad():
                 with _autocast_ctx(flags):
                     logits = model(images)
