@@ -83,10 +83,9 @@ class CharacteristicTransport2D(nn.Module):
 
         # Direction-specific value scaling for self + 8 neighbors.
         self.n_transport_dirs = 9
-        # [ABLATION] Commented out projection direction scaling
-        # self.direction_value_scale = nn.Parameter(
-        #     torch.ones(1, d_inner, self.n_transport_dirs, 1, 1)
-        # )
+        self.direction_value_scale = nn.Parameter(
+            torch.ones(1, d_inner, self.n_transport_dirs, 1, 1)
+        )
 
         # --- Phase rotation head (optional, per-channel angle Θ) ---
         self.phase_head = nn.Linear(d_inner, d_inner, bias=True)
@@ -208,8 +207,7 @@ class CharacteristicTransport2D(nn.Module):
             s_down_left,
             s_down_right,
         ], dim=2)
-        # [ABLATION] Commented out projection scaling
-        # neighbors = neighbors * self.direction_value_scale
+        neighbors = neighbors * self.direction_value_scale
         
         # Reshape for broadcasting instead of repeat_interleave
         # neighbors: (B, G, C, 9, H, W)
