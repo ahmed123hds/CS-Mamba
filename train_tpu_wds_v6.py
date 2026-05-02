@@ -173,11 +173,13 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
     def apply_mix(sample):
         images, labels = sample
         labels = labels.long() if isinstance(labels, torch.Tensor) else torch.tensor(labels, dtype=torch.long)
-        if np.random.random() < flags.mixup_prob:
-            mixed, la, lb, lam = mixup_data(images, labels, flags.mixup_alpha)
-        else:
-            mixed, la, lb, lam = cutmix_data(images, labels, flags.cutmix_alpha)
-        return mixed, la, lb, torch.tensor(lam, dtype=torch.float32)
+        # [ABLATION] Disabled mixup and cutmix
+        # if np.random.random() < flags.mixup_prob:
+        #     mixed, la, lb, lam = mixup_data(images, labels, flags.mixup_alpha)
+        # else:
+        #     mixed, la, lb, lam = cutmix_data(images, labels, flags.cutmix_alpha)
+        # return mixed, la, lb, torch.tensor(lam, dtype=torch.float32)
+        return images, labels, labels, torch.tensor(1.0, dtype=torch.float32)
 
     def apply_stack_val(sample):
         images, labels = sample
@@ -243,11 +245,13 @@ def build_tiny_loader(flags, is_training=True):
     def mixup_collate(batch):
         images = torch.stack([b[0] for b in batch])
         labels = torch.tensor([b[1] for b in batch], dtype=torch.long)
-        if np.random.random() < flags.mixup_prob:
-            mixed, la, lb, lam = mixup_data(images, labels, flags.mixup_alpha)
-        else:
-            mixed, la, lb, lam = cutmix_data(images, labels, flags.cutmix_alpha)
-        return mixed, la, lb, torch.tensor(lam, dtype=torch.float32)
+        # [ABLATION] Disabled mixup and cutmix
+        # if np.random.random() < flags.mixup_prob:
+        #     mixed, la, lb, lam = mixup_data(images, labels, flags.mixup_alpha)
+        # else:
+        #     mixed, la, lb, lam = cutmix_data(images, labels, flags.cutmix_alpha)
+        # return mixed, la, lb, torch.tensor(lam, dtype=torch.float32)
+        return images, labels, labels, torch.tensor(1.0, dtype=torch.float32)
 
     dataset = TinyImageNetDataset(ds["train"] if is_training else ds["valid"], transform)
     sampler = DistributedSampler(
@@ -366,7 +370,8 @@ def _mp_fn(index, flags):
                 loss = mixup_criterion(criterion, logits, labels_a, labels_b, lam)
             loss.backward()
             xm.reduce_gradients(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), flags.grad_clip)
+            # [ABLATION] Commented out gradient clipping
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), flags.grad_clip)
             xm.optimizer_step(optimizer)
             tracker.add(flags.batch_size)
 
