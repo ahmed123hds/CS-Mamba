@@ -103,11 +103,10 @@ class MixupCutMixCollate:
         imgs, labels = zip(*batch)
         imgs   = torch.stack(imgs)                             # (B, C, H, W)
         labels = torch.tensor(labels, dtype=torch.long)        # (B,)
-        # [ABLATION] Commented out CutMix branch, only use Mixup
-        # if random.random() < self.p_cutmix:
-        #     return self._cutmix(imgs, labels)
-        # else:
-        return self._mixup(imgs, labels)
+        if random.random() < self.p_cutmix:
+            return self._cutmix(imgs, labels)
+        else:
+            return self._mixup(imgs, labels)
 
 
 # ─────────────────────────────────────────────────────────
@@ -165,9 +164,9 @@ def train_one_epoch(model, train_loader_raw, train_sampler, optimizer, criterion
 
         loss.backward()
 
-        # [ABLATION] Commented out gradient clipping
-        # if grad_clip > 0:
-        #     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # Gradient clipping for training stability
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
         xm.optimizer_step(optimizer)
         if debug_first_step and step == 0:
