@@ -382,7 +382,6 @@ def _mp_fn(index, flags):
     if xm.is_master_ordinal():
         print(f"[SMOKE] Testing model forward pass (on CPU, no TPU)...", flush=True)
         try:
-            import torch
             dummy = torch.randn(2, 3, flags.img_size, flags.img_size)
             with torch.no_grad():
                 dummy_out = model.cpu()(dummy)
