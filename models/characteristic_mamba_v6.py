@@ -195,33 +195,26 @@ class CharacteristicTransport2D(nn.Module):
         s_down_left = s_pad[:, :, 2:, :-2]
         s_down_right = s_pad[:, :, 2:, 2:]
 
-        # Stack neighbors: (B, D, 9, H, W)
-        neighbors = torch.stack([
-            s_self,
-            s_up,
-            s_down,
-            s_left,
-            s_right,
-            s_up_left,
-            s_up_right,
-            s_down_left,
-            s_down_right,
-        ], dim=2)
-        # Reshape for broadcasting instead of repeat_interleave
-        # neighbors: (B, G, C, 9, H, W)
-        neighbors = neighbors.reshape(B, G, C, 9, H, W)
-        
-        # [XLA BUG FIX]: Multiply scale with routing FIRST, instead of multiplying scale with neighbors.
-        # This prevents the XLA compiler from trying to push the parameter multiplication through 
-        # the complex Pad->Slice->Stack view chain (which causes the hlo_instruction.cc SIGABRT).
+        # [XLA BUG FIX]: Multiply scale with routing FIRST.
         scale = self.direction_value_scale.reshape(1, G, C, 9, 1, 1)
         routing_bcast = routing.unsqueeze(2) # (B, G, 1, 9, H, W)
         
-        # Combined weight: (B, G, C, 9, H, W)
-        combined_weight = routing_bcast * scale
+        # Combined weight: (B, G, C, 9, H, W) -> (B, D, 9, H, W)
+        combined_weight = (routing_bcast * scale).view(B, D, 9, H, W)
         
-        # Weighted sum: (B, G, C, H, W) -> (B, D, H, W)
-        transported = (neighbors * combined_weight).sum(dim=3).view(B, D, H, W)
+        # [XLA BUG FIX]: Unroll the stack and sum to completely avoid XLA Tuple/Concat MultiOutputFusion bugs.
+        # Instead of stacking 9 views and then multiplying/summing, we do it iteratively.
+        transported = (
+            s_self * combined_weight[:, :, 0] +
+            s_up * combined_weight[:, :, 1] +
+            s_down * combined_weight[:, :, 2] +
+            s_left * combined_weight[:, :, 3] +
+            s_right * combined_weight[:, :, 4] +
+            s_up_left * combined_weight[:, :, 5] +
+            s_up_right * combined_weight[:, :, 6] +
+            s_down_left * combined_weight[:, :, 7] +
+            s_down_right * combined_weight[:, :, 8]
+        )
         return transported
 
     def forward(self, x: torch.Tensor, k_steps: int = 4) -> torch.Tensor:
