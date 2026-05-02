@@ -151,19 +151,20 @@ def build_lr_scheduler(optimizer, flags, scaled_lr):
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def xla_nodesplitter(urls):
-    import torch_xla.core.xla_model as xm
-    try:
-        rank = xm.get_ordinal()
-        world_size = xm.xrt_world_size()
-    except Exception:
-        rank = 0
-        world_size = 1
-    urls = list(urls)
-    return urls[rank::world_size]
-
 
 def build_wds_loader(shards_url, batch_size, flags, is_training=True):
+    import torch_xla.core.xla_model as xm
+    try:
+        global_rank = xm.get_ordinal()
+        global_world_size = xm.xrt_world_size()
+    except Exception:
+        global_rank = 0
+        global_world_size = 1
+
+    def safe_xla_nodesplitter(urls):
+        urls = list(urls)
+        return urls[global_rank::global_world_size]
+
     if is_training:
         transform = T.Compose([
             T.RandomResizedCrop(flags.img_size, scale=(0.08, 1.0), interpolation=T.InterpolationMode.BICUBIC),
@@ -204,7 +205,7 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
                 shards_url,
                 resampled=True,
                 shardshuffle=1000,
-                nodesplitter=xla_nodesplitter,
+                nodesplitter=safe_xla_nodesplitter,
                 empty_check=False,
             )
             .shuffle(5000)
@@ -220,7 +221,7 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
                 shards_url,
                 resampled=False,
                 shardshuffle=False,
-                nodesplitter=xla_nodesplitter,
+                nodesplitter=safe_xla_nodesplitter,
                 empty_check=False,
             )
             .decode("pil")
