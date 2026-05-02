@@ -151,10 +151,10 @@ def build_lr_scheduler(optimizer, flags, scaled_lr):
 
 
 def build_wds_loader(shards_url, batch_size, flags, is_training=True):
-    import torch_xla.core.xla_model as xm
     try:
-        global_rank = xm.get_ordinal()
-        global_world_size = xm.xrt_world_size()
+        import torch_xla.runtime as xr
+        global_rank = xr.global_ordinal()
+        global_world_size = xr.world_size()
     except Exception:
         global_rank = 0
         global_world_size = 1
@@ -204,7 +204,7 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
             shards_url, 
             resampled=is_training, 
             nodesplitter=safe_xla_nodesplitter, 
-            shardshuffle=1000 if is_training else False,
+            shardshuffle=False,
             empty_check=False,
         )
         .shuffle(5000 if is_training else 0)
@@ -377,6 +377,8 @@ def _mp_fn(index, flags):
         tracker = xm.RateTracker()
         total_loss, total_correct, total = 0.0, 0.0, 0
         t0 = time.time()
+        
+        xm.master_print(f"=== Starting Epoch {epoch}. First step will take 5-10 minutes for XLA Compilation! ===")
 
         for step, batch in enumerate(para_train):
             if step >= train_steps:
