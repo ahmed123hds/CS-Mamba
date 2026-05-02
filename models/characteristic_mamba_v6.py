@@ -135,44 +135,36 @@ class CharacteristicTransport2D(nn.Module):
     @staticmethod
     def _velocity_to_routing(vx: torch.Tensor, vy: torch.Tensor,
                               self_logits: torch.Tensor,
-                              temperature: float = 1.0) -> tuple:
+                              temperature: float = 1.0) -> torch.Tensor:
         """
         Convert velocity (vx, vy) to self + 8-neighbor routing weights.
 
-        Returns: tuple of 9 routing weight tensors, each (B, G, H, W),
-                 summing to 1 across the 9 directions.
+        Neighbors: self, up, down, left, right, and four diagonals.
+        Neighbor logits come from velocity-direction dot products; the self
+        logit is learned directly because velocity alone cannot favor staying.
 
-        [XLA FIX]: Manual softmax without torch.stack to prevent
-        XLA fusion_emitter crash on TPU.
+        Returns: routing weights (B, G, 9, H, W) summing to 1 along dim=2.
         """
         inv_sqrt2 = 1.0 / math.sqrt(2.0)
-        raw = [
-            self_logits / temperature,
-            -vx / temperature,
-            vx / temperature,
-            -vy / temperature,
-            vy / temperature,
-            (-vx - vy) * (inv_sqrt2 / temperature),
-            (-vx + vy) * (inv_sqrt2 / temperature),
-            (vx - vy) * (inv_sqrt2 / temperature),
-            (vx + vy) * (inv_sqrt2 / temperature),
-        ]
-        # Numerically stable softmax without torch.stack
-        max_logit = raw[0]
-        for r in raw[1:]:
-            max_logit = torch.max(max_logit, r)
-        exps = [torch.exp(r - max_logit) for r in raw]
-        total = exps[0]
-        for e in exps[1:]:
-            total = total + e
-        return tuple(e / total for e in exps)
+        logits = torch.stack([
+            self_logits,
+            -vx,
+            vx,
+            -vy,
+            vy,
+            (-vx - vy) * inv_sqrt2,
+            (-vx + vy) * inv_sqrt2,
+            (vx - vy) * inv_sqrt2,
+            (vx + vy) * inv_sqrt2,
+        ], dim=2) / temperature
+        return F.softmax(logits, dim=2)
 
-    def _transport(self, state: torch.Tensor, routing: tuple) -> torch.Tensor:
+    def _transport(self, state: torch.Tensor, routing: torch.Tensor) -> torch.Tensor:
         """
         Transport state using self + 8-neighbor weighted gather.
 
         state:   (B, D, H, W)
-        routing: tuple of 9 tensors, each (B, G, H, W)
+        routing: (B, G, 9, H, W) — G groups, each controlling D//G channels
 
         Returns: transported state (B, D, H, W)
         """
@@ -194,18 +186,25 @@ class CharacteristicTransport2D(nn.Module):
         s_down_left  = s_pad[:, :, 2:, :-2]
         s_down_right = s_pad[:, :, 2:, 2:]
 
-        neighbors = [s_self, s_up, s_down, s_left, s_right,
-                     s_up_left, s_up_right, s_down_left, s_down_right]
+        # Efficient single-broadcast weight computation
+        scale = self.direction_value_scale.reshape(1, G, C, 9, 1, 1)
+        routing_bcast = routing.unsqueeze(2)  # (B, G, 1, 9, H, W)
+        combined_weight = (routing_bcast * scale).view(B, D, 9, H, W)
 
-        # [XLA FIX]: Compute per-direction weight WITHOUT any torch.stack/cat.
-        # Each direction gets: routing_i (B,G,H,W) * scale_i (1,G,C,1,1) → (B,D,H,W)
-        transported = torch.zeros_like(state)
-        for i in range(9):
-            r_i = routing[i].unsqueeze(2)                                    # (B, G, 1, H, W)
-            s_i = self.direction_value_scale[:, :, i, :, :].reshape(1, G, C, 1, 1)  # (1, G, C, 1, 1)
-            w_i = (r_i * s_i).reshape(B, D, H, W)
-            transported = transported + neighbors[i] * w_i
-
+        # [XLA FIX]: Unrolled weighted sum — avoids torch.stack on neighbors
+        # which triggers XLA MultiOutputFusion crash. The weight computation
+        # above is safe because it uses a single broadcast multiply.
+        transported = (
+            s_self       * combined_weight[:, :, 0] +
+            s_up         * combined_weight[:, :, 1] +
+            s_down       * combined_weight[:, :, 2] +
+            s_left       * combined_weight[:, :, 3] +
+            s_right      * combined_weight[:, :, 4] +
+            s_up_left    * combined_weight[:, :, 5] +
+            s_up_right   * combined_weight[:, :, 6] +
+            s_down_left  * combined_weight[:, :, 7] +
+            s_down_right * combined_weight[:, :, 8]
+        )
         return transported
 
     def forward(self, x: torch.Tensor, k_steps: int = 4) -> torch.Tensor:
