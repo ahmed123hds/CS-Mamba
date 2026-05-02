@@ -345,9 +345,8 @@ def _mp_fn(index, flags):
         shuffle=False
     )
 
-    # [ABLATION] Commented out Mixup/CutMix entirely
-    # use_mixup = not getattr(flags, 'no_mixup', False)
-    use_mixup = False
+    # [ABLATION] Mixup restored (CutMix remains disabled in collate)
+    use_mixup = not getattr(flags, 'no_mixup', False)
     mixup_collate = MixupCutMixCollate(n_classes=flags.n_classes) if use_mixup else None
 
     train_loader_raw = DataLoader(
