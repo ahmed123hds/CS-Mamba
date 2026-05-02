@@ -217,10 +217,8 @@ def build_wds_loader(shards_url, batch_size, flags, is_training=True):
     return wds.WebLoader(
         dataset,
         batch_size=None,
-        num_workers=flags.num_workers,
+        num_workers=0,
         pin_memory=True,
-        prefetch_factor=2 if flags.num_workers > 0 else None,
-        persistent_workers=False,
     )
 
 

@@ -135,86 +135,77 @@ class CharacteristicTransport2D(nn.Module):
     @staticmethod
     def _velocity_to_routing(vx: torch.Tensor, vy: torch.Tensor,
                               self_logits: torch.Tensor,
-                              temperature: float = 1.0) -> torch.Tensor:
+                              temperature: float = 1.0) -> tuple:
         """
         Convert velocity (vx, vy) to self + 8-neighbor routing weights.
 
-        Neighbors: self, up, down, left, right, and four diagonals.
-        Neighbor logits come from velocity-direction dot products; the self
-        logit is learned directly because velocity alone cannot favor staying.
+        Returns: tuple of 9 routing weight tensors, each (B, G, H, W),
+                 summing to 1 across the 9 directions.
 
-        Returns: routing weights (B, G, 9, H, W) summing to 1 along dim=2.
+        [XLA FIX]: Manual softmax without torch.stack to prevent
+        XLA fusion_emitter crash on TPU.
         """
         inv_sqrt2 = 1.0 / math.sqrt(2.0)
-        logits_self = self_logits
-        logits_up = -vx
-        logits_down = vx
-        logits_left = -vy
-        logits_right = vy
-        logits_up_left = (-vx - vy) * inv_sqrt2
-        logits_up_right = (-vx + vy) * inv_sqrt2
-        logits_down_left = (vx - vy) * inv_sqrt2
-        logits_down_right = (vx + vy) * inv_sqrt2
+        raw = [
+            self_logits / temperature,
+            -vx / temperature,
+            vx / temperature,
+            -vy / temperature,
+            vy / temperature,
+            (-vx - vy) * (inv_sqrt2 / temperature),
+            (-vx + vy) * (inv_sqrt2 / temperature),
+            (vx - vy) * (inv_sqrt2 / temperature),
+            (vx + vy) * (inv_sqrt2 / temperature),
+        ]
+        # Numerically stable softmax without torch.stack
+        max_logit = raw[0]
+        for r in raw[1:]:
+            max_logit = torch.max(max_logit, r)
+        exps = [torch.exp(r - max_logit) for r in raw]
+        total = exps[0]
+        for e in exps[1:]:
+            total = total + e
+        return tuple(e / total for e in exps)
 
-        logits = torch.stack([
-            logits_self,
-            logits_up,
-            logits_down,
-            logits_left,
-            logits_right,
-            logits_up_left,
-            logits_up_right,
-            logits_down_left,
-            logits_down_right,
-        ], dim=2) / temperature
-        return F.softmax(logits, dim=2)
-
-    def _transport(self, state: torch.Tensor, routing: torch.Tensor) -> torch.Tensor:
+    def _transport(self, state: torch.Tensor, routing: tuple) -> torch.Tensor:
         """
         Transport state using self + 8-neighbor weighted gather.
 
-        state: (B, D, H, W)
-        routing: (B, G, 9, H, W) — G groups, each controlling D//G channels
+        state:   (B, D, H, W)
+        routing: tuple of 9 tensors, each (B, G, H, W)
 
         Returns: transported state (B, D, H, W)
         """
         B, D, H, W = state.shape
         G = self.n_flow_groups
-        C = D // G  # channels per group
+        C = D // G
 
-        # Gather neighbors via constant padding
-        # Circular padding translates into hundreds of slice+concat ops in XLA compiler.
+        # Gather neighbors — reuse padded tensors to reduce F.pad calls
         s_self = state
-        s_up    = F.pad(state, [0, 0, 1, 1], mode="constant", value=0.0)[:, :, :-2, :]
-        s_down  = F.pad(state, [0, 0, 1, 1], mode="constant", value=0.0)[:, :, 2:,  :]
-        s_left  = F.pad(state, [1, 1, 0, 0], mode="constant", value=0.0)[:, :, :, :-2]
-        s_right = F.pad(state, [1, 1, 0, 0], mode="constant", value=0.0)[:, :, :, 2:]
+        s_pad_h = F.pad(state, [0, 0, 1, 1], mode="constant", value=0.0)
+        s_up   = s_pad_h[:, :, :-2, :]
+        s_down = s_pad_h[:, :, 2:,  :]
+        s_pad_w = F.pad(state, [1, 1, 0, 0], mode="constant", value=0.0)
+        s_left  = s_pad_w[:, :, :, :-2]
+        s_right = s_pad_w[:, :, :, 2:]
         s_pad = F.pad(state, [1, 1, 1, 1], mode="constant", value=0.0)
-        s_up_left = s_pad[:, :, :-2, :-2]
-        s_up_right = s_pad[:, :, :-2, 2:]
-        s_down_left = s_pad[:, :, 2:, :-2]
+        s_up_left    = s_pad[:, :, :-2, :-2]
+        s_up_right   = s_pad[:, :, :-2, 2:]
+        s_down_left  = s_pad[:, :, 2:, :-2]
         s_down_right = s_pad[:, :, 2:, 2:]
 
-        # [XLA BUG FIX]: Multiply scale with routing FIRST.
-        scale = self.direction_value_scale.reshape(1, G, C, 9, 1, 1)
-        routing_bcast = routing.unsqueeze(2) # (B, G, 1, 9, H, W)
-        
-        # Combined weight: (B, G, C, 9, H, W) -> (B, D, 9, H, W)
-        combined_weight = (routing_bcast * scale).view(B, D, 9, H, W)
-        
-        # [XLA BUG FIX]: Unroll the stack and sum to completely avoid XLA Tuple/Concat MultiOutputFusion bugs.
-        # Instead of stacking 9 views and then multiplying/summing, we do it iteratively.
-        transported = (
-            s_self * combined_weight[:, :, 0] +
-            s_up * combined_weight[:, :, 1] +
-            s_down * combined_weight[:, :, 2] +
-            s_left * combined_weight[:, :, 3] +
-            s_right * combined_weight[:, :, 4] +
-            s_up_left * combined_weight[:, :, 5] +
-            s_up_right * combined_weight[:, :, 6] +
-            s_down_left * combined_weight[:, :, 7] +
-            s_down_right * combined_weight[:, :, 8]
-        )
+        neighbors = [s_self, s_up, s_down, s_left, s_right,
+                     s_up_left, s_up_right, s_down_left, s_down_right]
+
+        # [XLA FIX]: Compute per-direction weight WITHOUT any torch.stack/cat.
+        # Each direction gets: routing_i (B,G,H,W) * scale_i (1,G,C,1,1) → (B,D,H,W)
+        transported = torch.zeros_like(state)
+        for i in range(9):
+            r_i = routing[i].unsqueeze(2)                                    # (B, G, 1, H, W)
+            s_i = self.direction_value_scale[:, :, i, :, :].reshape(1, G, C, 1, 1)  # (1, G, C, 1, 1)
+            w_i = (r_i * s_i).reshape(B, D, H, W)
+            transported = transported + neighbors[i] * w_i
+
         return transported
 
     def forward(self, x: torch.Tensor, k_steps: int = 4) -> torch.Tensor:
