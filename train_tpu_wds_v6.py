@@ -366,12 +366,13 @@ def _mp_fn(index, flags):
     xm.master_print(f"Scaled LR: {scaled_lr:.6f} | AMP BF16: {flags.amp_bf16} | Flow Groups: {flags.n_flow_groups}")
     xm.master_print(f"{'='*72}\n")
 
+    # Build device loaders ONCE outside the epoch loop
+    para_train = pl.MpDeviceLoader(train_loader, device)
+    para_val = pl.MpDeviceLoader(val_loader, device)
+
     for epoch in range(start_epoch, flags.epochs + 1):
         if not is_imagenet:
             train_loader.sampler.set_epoch(epoch)
-
-        pl_train = pl.ParallelLoader(train_loader, [device])
-        para_train = pl_train.per_device_loader(device)
 
         model.train()
         tracker = xm.RateTracker()
@@ -410,11 +411,7 @@ def _mp_fn(index, flags):
         g_loss = xm.mesh_reduce("tr_loss", total_loss, np.sum) / g_total
         g_acc = 100.0 * xm.mesh_reduce("tr_c", total_correct, np.sum) / g_total
 
-        del para_train, pl_train
         gc.collect()
-
-        pl_val = pl.ParallelLoader(val_loader, [device])
-        para_val = pl_val.per_device_loader(device)
 
         model.eval()
         v_correct, v_total = 0, 0
@@ -434,7 +431,6 @@ def _mp_fn(index, flags):
         v_acc = 100.0 * xm.mesh_reduce("v_c", v_correct, np.sum) / max(xm.mesh_reduce("v_n", v_total, np.sum), 1)
         scheduler.step()
 
-        del para_val, pl_val
         gc.collect()
 
         xm.master_print(
