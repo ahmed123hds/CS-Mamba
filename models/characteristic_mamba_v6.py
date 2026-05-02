@@ -207,11 +207,14 @@ class CharacteristicTransport2D(nn.Module):
             s_down_left,
             s_down_right,
         ], dim=2)
-        neighbors = neighbors * self.direction_value_scale
-        
         # Reshape for broadcasting instead of repeat_interleave
         # neighbors: (B, G, C, 9, H, W)
         neighbors = neighbors.reshape(B, G, C, 9, H, W)
+        
+        # Apply direction value scale after reshape to avoid XLA HLO fusion bug
+        scale = self.direction_value_scale.reshape(1, G, C, 9, 1, 1)
+        neighbors = neighbors * scale
+        
         # routing: (B, G, 1, 9, H, W)
         routing_bcast = routing.unsqueeze(2)
         
